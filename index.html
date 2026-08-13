@@ -442,21 +442,31 @@ let transactions = [];  // {id,ts,type,upc,name,qty,note}
 let invoices = [];      // {id,number,date,customerName,customerPhone,items,subtotal,discountType,discountValue,discountAmount,taxRate,taxAmount,total}
 let cart = [];          // {upc,name,price,qty}
 
-/* ---------- Apps Script Sync Layer ---------- */
-/* Data lives in a Google Sheet on the server (Code.gs), shared live by
-   everyone who enters the correct passcode. No data is stored in this
+/* ---------- Apps Script API Sync Layer ---------- */
+/* This page is hosted separately from Apps Script (e.g. GitHub Pages) so
+   iOS lets the camera work — it talks to your Google Sheet backend over
+   plain HTTPS instead of google.script.run. No data is stored in this
    browser at all — every screen renders from the latest server snapshot. */
+
+// PASTE YOUR APPS SCRIPT WEB APP URL HERE (ends in /exec):
+const API_URL = 'https://script.google.com/macros/s/AKfycby54VVAbcdOuT6Kj9zliVKEifGfY5oC39zEAUjWQPNW1d6FQqMxDeobi14d6brk-CWC/exec';
+
 let passcode = '';
 let authed = false;
 let autoRefreshTimer = null;
 
-function callServer(fnName, ...args){
-  return new Promise((resolve, reject)=>{
-    google.script.run
-      .withSuccessHandler(resolve)
-      .withFailureHandler(reject)
-      [fnName](...args);
+async function callServer(fnName, ...args){
+  if(!API_URL || API_URL.indexOf('PASTE_YOUR') === 0){
+    throw new Error('Backend URL not configured — edit API_URL at the top of this file');
+  }
+  const res = await fetch(API_URL, {
+    method: 'POST',
+    // text/plain avoids a CORS preflight request, which Apps Script doesn't support
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    body: JSON.stringify({ action: fnName, args })
   });
+  if(!res.ok) throw new Error('Network error: ' + res.status);
+  return res.json();
 }
 function setFilebar(state, text){
   const dot = document.getElementById('filebarDot');
@@ -1206,4 +1216,3 @@ renderAll(); // renders an empty shell behind the login overlay
 </script>
 </body>
 </html>
-
