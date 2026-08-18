@@ -291,6 +291,7 @@
             <button class="btn secondary block" id="toggleCamBtn" type="button">Start Camera</button>
             <button class="btn secondary block" id="toggleTorchBtn" type="button" style="display:none;">Flash</button>
           </div>
+          <button class="btn block" id="captureBtn1" type="button" style="margin-top:8px;display:none;">📸 Capture &amp; Scan</button>
           <div class="manual-entry">
             <input type="text" id="manualUpc" placeholder="Or type UPC manually…">
             <button class="btn" id="manualUpcBtn" type="button">Go</button>
@@ -336,6 +337,7 @@
         <div class="row">
           <button class="btn secondary block" id="toggleCamBtn2" type="button">Use Camera</button>
         </div>
+        <button class="btn block" id="captureBtn2" type="button" style="margin-top:8px;display:none;">📸 Capture &amp; Scan</button>
         <div class="manual-entry">
           <input type="text" id="saleUpc" placeholder="Scan or type UPC, then Enter…">
         </div>
@@ -428,6 +430,7 @@
 
 <div class="overlay" id="overlay"><div class="modal" id="modalBody"></div></div>
 <div class="toast-stack" id="toastStack"></div>
+<div id="captureHelper" style="display:none;"></div>
 
 <div id="invoicePrintArea"><div class="inv-doc" id="invoiceDoc"></div></div>
 
@@ -819,13 +822,14 @@ async function startScanner1(){
     scanner1 = new Html5Qrcode("reader");
     await scanner1.start(
       { facingMode:"environment" },
-      { fps:10, qrbox:{width:260,height:150}, formatsToSupport: formats },
+      { fps:10, qrbox:{width:280,height:160}, formatsToSupport: formats },
       (decodedText)=> handleScan(decodedText, 'stock'),
       ()=>{}
     );
     scanner1Running = true;
-    hint.textContent = 'Point the camera at a barcode';
+    hint.textContent = 'Point the camera at a barcode — or tap Capture & Scan below if it isn\u2019t picking it up automatically';
     document.getElementById('toggleCamBtn').textContent = 'Stop Camera';
+    document.getElementById('captureBtn1').style.display = 'block';
     checkTorch();
   }catch(err){
     hint.textContent = 'Camera unavailable — use manual entry below.';
@@ -839,6 +843,7 @@ async function stopScanner1(){
   scanner1Running = false;
   document.getElementById('toggleCamBtn').textContent = 'Start Camera';
   document.getElementById('scanHint').textContent = 'Camera stopped.';
+  document.getElementById('captureBtn1').style.display = 'none';
 }
 document.getElementById('toggleCamBtn').addEventListener('click', function(){
   scanner1Running ? stopScanner1() : startScanner1();
@@ -857,6 +862,49 @@ async function checkTorch(){
     }
   }catch(e){}
 }
+
+/* ---------- Manual capture-and-decode (fallback for when live scanning misses) ---------- */
+let fileScanner = null;
+function getFileScanner(){
+  if(!fileScanner) fileScanner = new Html5Qrcode('captureHelper', { formatsToSupport: formats });
+  return fileScanner;
+}
+function grabFrameAsFile(containerId){
+  return new Promise((resolve, reject)=>{
+    const video = document.querySelector('#'+containerId+' video');
+    if(!video || !video.videoWidth){ reject(new Error('Camera not ready yet')); return; }
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+    canvas.toBlob(blob=>{
+      if(!blob){ reject(new Error('Could not capture frame')); return; }
+      resolve(new File([blob], 'capture.png', {type:'image/png'}));
+    }, 'image/png');
+  });
+}
+async function captureAndScan(containerId, context, btnEl){
+  const originalLabel = btnEl.textContent;
+  btnEl.disabled = true;
+  btnEl.textContent = 'Scanning…';
+  try{
+    const file = await grabFrameAsFile(containerId);
+    const scanner = getFileScanner();
+    const decoded = await scanner.scanFile(file, false);
+    handleScan(decoded, context);
+  }catch(err){
+    toast('No barcode found in that frame — try getting closer, better light, or hold it steadier', true);
+  }finally{
+    btnEl.disabled = false;
+    btnEl.textContent = originalLabel;
+  }
+}
+document.getElementById('captureBtn1').addEventListener('click', function(){
+  captureAndScan('reader', 'stock', this);
+});
+document.getElementById('captureBtn2').addEventListener('click', function(){
+  captureAndScan('reader2', 'sale', this);
+});
 
 function handleScan(code, context){
   const now = Date.now();
