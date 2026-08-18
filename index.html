@@ -311,16 +311,20 @@
       <h2>Inventory</h2>
       <div class="searchbar">
         <input type="text" id="invSearch" placeholder="Search by name or UPC…">
+        <select id="invWarehouseFilter"><option value="">All warehouses</option></select>
+        <select id="invCategoryFilter"><option value="">All categories</option></select>
+      </div>
+      <div class="searchbar">
         <button class="btn secondary" id="exportExcelBtn" type="button">⇩ Export Excel</button>
         <button class="btn secondary" id="importExcelBtn" type="button">⇧ Import Excel</button>
         <input type="file" id="importExcelFile" accept=".xlsx,.xls,.csv" style="display:none;">
         <button class="btn secondary" id="addProductBtn" type="button">+ Add Product</button>
       </div>
-      <div class="scan-hint" style="text-align:left;margin:-4px 0 14px;">Import matches rows to products by UPC — existing UPCs are updated, new UPCs are added. Export first to get the exact column format.</div>
+      <div class="scan-hint" style="text-align:left;margin:-4px 0 14px;">One row per SKU + warehouse. Import matches rows to products by UPC — existing UPCs are updated, new UPCs are added. Export first to get the exact column format.</div>
       <div style="overflow-x:auto;">
         <table id="invTable">
           <thead><tr>
-            <th>Product</th><th>UPC</th><th class="num">Cost</th><th class="num">Price</th><th class="num">Qty</th><th class="num">Units/Box</th><th></th>
+            <th></th><th>Product</th><th>Category</th><th>UPC</th><th>Warehouse</th><th class="num">Cost</th><th class="num">Price</th><th class="num">Qty</th><th class="num">Units/Box</th><th></th>
           </tr></thead>
           <tbody id="invTableBody"></tbody>
         </table>
@@ -380,6 +384,14 @@
       <div class="stat"><div class="n" id="repInvValue">RM 0.00</div><div class="l">Inventory value on hand</div></div>
     </div>
     <div class="card" style="margin-top:16px;">
+      <h2>Sales by Category <small>which categories sell best</small></h2>
+      <div id="categorySales"></div>
+    </div>
+    <div class="card">
+      <h2>Inventory by Warehouse <small>stock spread across locations</small></h2>
+      <div id="warehouseBreakdown"></div>
+    </div>
+    <div class="card">
       <h2>Best Sellers <small>by units sold</small></h2>
       <div id="bestSellers"></div>
     </div>
@@ -391,7 +403,7 @@
       <h2>Stock Movement Log</h2>
       <div style="overflow-x:auto;">
         <table>
-          <thead><tr><th>Date</th><th>Type</th><th>Product</th><th class="num">Qty</th><th class="num">Balance After</th><th>Note</th></tr></thead>
+          <thead><tr><th>Date</th><th>Type</th><th>Product</th><th>Category</th><th>Warehouse</th><th class="num">Qty</th><th class="num">Balance After</th><th>Note</th></tr></thead>
           <tbody id="movementLog"></tbody>
         </table>
       </div>
@@ -440,10 +452,12 @@
 
 /* ---------- State ---------- */
 let settings = { shopName:"Throttle & Gear", address:"", phone:"", currency:"RM", taxRate:0, logo:"", invoiceCounter:1 };
-let products = [];      // {upc,name,price,cost,unitsPerBox,qty,createdAt}
-let transactions = [];  // {id,ts,type,upc,name,qty,note}
+let products = [];      // {upc,name,price,cost,unitsPerBox,qty,createdAt,category,photo} — qty = total across all warehouses
+let stock = [];          // {upc,warehouse,qty} — one row per SKU+warehouse combo, source of truth for quantities
+let transactions = [];  // {id,ts,type,upc,name,qty,balance,note,cost,category,warehouse}
 let invoices = [];      // {id,number,date,customerName,customerPhone,items,subtotal,discountType,discountValue,discountAmount,taxRate,taxAmount,total}
-let cart = [];          // {upc,name,price,qty}
+let categories = [];    // fixed list of category names, sent by the server
+let cart = [];          // {upc,warehouse,name,price,qty}
 
 /* ---------- Apps Script API Sync Layer ---------- */
 /* This page is hosted separately from Apps Script (e.g. GitHub Pages) so
@@ -479,8 +493,10 @@ function setFilebar(state, text){
 function applySnapshot(snap){
   settings = Object.assign(settings, snap.settings || {});
   products = Array.isArray(snap.products) ? snap.products : [];
+  stock = Array.isArray(snap.stock) ? snap.stock : [];
   transactions = Array.isArray(snap.transactions) ? snap.transactions : [];
   invoices = Array.isArray(snap.invoices) ? snap.invoices : [];
+  categories = Array.isArray(snap.categories) ? snap.categories : categories;
   renderAll();
   setFilebar('connected', 'Synced ' + new Date().toLocaleTimeString());
 }
@@ -537,6 +553,16 @@ async function attemptLogin(){
 function money(n){ return settings.currency + ' ' + (Math.round((n+Number.EPSILON)*100)/100).toFixed(2); }
 function uid(){ return Date.now().toString(36) + Math.random().toString(36).slice(2,7); }
 function findProduct(upc){ return products.find(p => p.upc === upc); }
+function stockFor(upc){ return stock.filter(s => s.upc === upc); }
+function stockForWarehouse(upc, warehouse){ return stock.find(s => s.upc === upc && s.warehouse === warehouse); }
+function knownWarehouses(){
+  const set = new Set(stock.map(s => s.warehouse).filter(Boolean));
+  if(!set.size) set.add('Main');
+  return Array.from(set).sort();
+}
+function warehouseDatalist(){
+  return knownWarehouses().map(w => `<option value="${esc(w)}">`).join('');
+}
 function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function fmtDate(ts){ const d = new Date(ts); return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}); }
 
@@ -602,61 +628,93 @@ function renderDashboard(){
     '</tbody></table>';
 }
 
+function populateInvFilters(){
+  const whSel = document.getElementById('invWarehouseFilter');
+  const catSel = document.getElementById('invCategoryFilter');
+  const curWh = whSel.value, curCat = catSel.value;
+  whSel.innerHTML = '<option value="">All warehouses</option>' + knownWarehouses().map(w=>`<option value="${esc(w)}">${esc(w)}</option>`).join('');
+  catSel.innerHTML = '<option value="">All categories</option>' + categories.map(c=>`<option value="${esc(c)}">${esc(c)}</option>`).join('');
+  whSel.value = curWh; catSel.value = curCat;
+}
 function renderInventory(filter){
-  filter = (filter||'').toLowerCase();
-  const list = products.filter(p => !filter || p.name.toLowerCase().includes(filter) || p.upc.includes(filter));
+  filter = (filter !== undefined ? filter : document.getElementById('invSearch').value || '').toLowerCase();
+  populateInvFilters();
+  const whFilter = document.getElementById('invWarehouseFilter').value;
+  const catFilter = document.getElementById('invCategoryFilter').value;
   const body = document.getElementById('invTableBody');
-  if(!list.length){
-    body.innerHTML = `<tr><td colspan="7"><div class="empty"><div class="big">No products</div>Scan a box or add one manually to get started.</div></td></tr>`;
+
+  // Build one row per (product, warehouse) — products with no stock rows yet still show once.
+  let rows = [];
+  products.forEach(p=>{
+    const locs = stockFor(p.upc);
+    if(!locs.length){ rows.push({p, warehouse:'', qty:0}); }
+    else locs.forEach(l=> rows.push({p, warehouse:l.warehouse, qty:l.qty}));
+  });
+  rows = rows.filter(r =>
+    (!filter || r.p.name.toLowerCase().includes(filter) || r.p.upc.includes(filter)) &&
+    (!whFilter || r.warehouse === whFilter) &&
+    (!catFilter || r.p.category === catFilter)
+  );
+
+  if(!rows.length){
+    body.innerHTML = `<tr><td colspan="10"><div class="empty"><div class="big">No products</div>Scan a box or add one manually to get started.</div></td></tr>`;
     return;
   }
-  body.innerHTML = list.map(p => `
+  body.innerHTML = rows.map(r => { const p = r.p; return `
     <tr>
+      <td>${p.photo ? `<img src="${p.photo}" style="width:36px;height:36px;object-fit:cover;border-radius:6px;">` : ''}</td>
       <td>${esc(p.name)}</td>
+      <td>${p.category ? `<span class="pill sale">${esc(p.category)}</span>` : '—'}</td>
       <td class="mono">${esc(p.upc)}</td>
+      <td class="mono">${esc(r.warehouse || '—')}</td>
       <td class="num mono">${p.cost!=null ? money(p.cost) : '—'}</td>
       <td class="num mono">${money(p.price)}</td>
-      <td class="num mono">${p.qty}</td>
+      <td class="num mono">${r.qty}</td>
       <td class="num mono">${p.unitsPerBox||1}</td>
       <td>
         <div class="row" style="gap:6px;">
-          <button class="btn secondary sm" data-act="in" data-upc="${esc(p.upc)}">+In</button>
-          <button class="btn secondary sm" data-act="out" data-upc="${esc(p.upc)}">-Out</button>
+          <button class="btn secondary sm" data-act="in" data-upc="${esc(p.upc)}" data-wh="${esc(r.warehouse)}">+In</button>
+          <button class="btn secondary sm" data-act="out" data-upc="${esc(p.upc)}" data-wh="${esc(r.warehouse)}">-Out</button>
           <button class="icon-btn" data-act="del" data-upc="${esc(p.upc)}" title="Delete">✕</button>
         </div>
       </td>
-    </tr>`).join('');
+    </tr>`; }).join('');
 }
 document.getElementById('invTableBody').addEventListener('click', function(e){
   const btn = e.target.closest('button[data-act]');
   if(!btn) return;
   const p = findProduct(btn.dataset.upc);
   if(!p) return;
-  if(btn.dataset.act === 'in') showStockModal(p,'in');
-  else if(btn.dataset.act === 'out') showStockModal(p,'out');
+  if(btn.dataset.act === 'in') showStockModal(p,'in', btn.dataset.wh || null);
+  else if(btn.dataset.act === 'out') showStockModal(p,'out', btn.dataset.wh || null);
   else if(btn.dataset.act === 'del'){
-    if(confirm(`Remove "${p.name}" from inventory? Stock history is kept.`)){
+    if(confirm(`Remove "${p.name}" from inventory (all warehouses)? Stock history is kept.`)){
       persist(()=>callServer('deleteProductServer', passcode, p.upc));
       toast('Product removed');
     }
   }
 });
 document.getElementById('invSearch').addEventListener('input', e=>renderInventory(e.target.value));
+document.getElementById('invWarehouseFilter').addEventListener('change', ()=>renderInventory());
+document.getElementById('invCategoryFilter').addEventListener('change', ()=>renderInventory());
 document.getElementById('addProductBtn').addEventListener('click', ()=>showNewProductModal(''));
 
 /* ---------- Excel Import / Export ---------- */
 function exportInventoryExcel(){
   if(typeof XLSX === 'undefined'){ toast('Excel library failed to load — check your connection', true); return; }
-  const rows = products.map(p => ({
-    UPC: p.upc,
-    Name: p.name,
-    Cost: p.cost!=null ? p.cost : '',
-    Price: p.price,
-    Qty: p.qty,
-    'Units per Box': p.unitsPerBox || 1
-  }));
+  let rows = [];
+  products.forEach(p=>{
+    const locs = stockFor(p.upc);
+    const lines = locs.length ? locs : [{warehouse:'', qty:0}];
+    lines.forEach(l=>{
+      rows.push({
+        UPC: p.upc, Name: p.name, Category: p.category || '', Cost: p.cost!=null ? p.cost : '',
+        Price: p.price, Warehouse: l.warehouse, Qty: l.qty, 'Units per Box': p.unitsPerBox || 1
+      });
+    });
+  });
   const ws = XLSX.utils.json_to_sheet(rows);
-  ws['!cols'] = [{wch:16},{wch:34},{wch:10},{wch:10},{wch:8},{wch:14}];
+  ws['!cols'] = [{wch:16},{wch:34},{wch:20},{wch:10},{wch:10},{wch:14},{wch:8},{wch:14}];
   const wb = XLSX.utils.book_new();
   XLSX.utils.book_append_sheet(wb, ws, 'Inventory');
   XLSX.writeFile(wb, `inventory-${new Date().toISOString().slice(0,10)}.xlsx`);
@@ -683,6 +741,8 @@ document.getElementById('importExcelFile').addEventListener('change', function(e
         return {
           upc: String(norm['upc']||'').trim(),
           name: String(norm['name']||'').trim(),
+          category: String(norm['category']||'').trim(),
+          warehouse: String(norm['warehouse']||'').trim(),
           price: norm['price'], cost: norm['cost'], qty: norm['qty'],
           unitsPerBox: parseInt(norm['units per box'],10) || 1,
           hasPrice: norm['price']!==undefined && norm['price']!=='',
@@ -702,11 +762,24 @@ document.getElementById('importExcelFile').addEventListener('change', function(e
 });
 
 /* ---------- Stock In/Out Modal ---------- */
-function showStockModal(product, mode){
+function showStockModal(product, mode, warehouseHint){
   const isIn = mode === 'in';
+  const locs = stockFor(product.upc);
+  const fixedWarehouse = warehouseHint || (locs.length === 1 ? locs[0].warehouse : null);
+  const currentQtyHere = fixedWarehouse ? (stockForWarehouse(product.upc, fixedWarehouse)?.qty || 0) : product.qty;
   openModal(`
     <h3>${isIn?'Stock In':'Stock Out'}</h3>
-    <div class="sub">${esc(product.name)} · UPC ${esc(product.upc)} · Currently ${product.qty} in stock</div>
+    <div class="sub">${esc(product.name)} · UPC ${esc(product.upc)} · ${product.qty} total across all warehouses</div>
+    ${fixedWarehouse ? `
+      <label>Warehouse</label>
+      <input type="text" value="${esc(fixedWarehouse)}" readonly style="opacity:0.7;">
+      <div class="scan-hint" style="text-align:left;margin:4px 0 0;">Currently ${currentQtyHere} unit(s) here</div>
+    ` : `
+      <label>Warehouse</label>
+      <input type="text" id="adjWarehouse" list="warehouseListDatalist" value="${locs[0]?esc(locs[0].warehouse):'Main'}" placeholder="e.g. Main, KL-Store, JB-Warehouse">
+      <datalist id="warehouseListDatalist">${warehouseDatalist()}</datalist>
+      ${locs.length>1 ? `<div class="scan-hint" style="text-align:left;margin:4px 0 0;">In stock at: ${locs.map(l=>esc(l.warehouse)+' ('+l.qty+')').join(', ')}</div>` : ''}
+    `}
     <label>Mode</label>
     <select id="adjMode">
       <option value="units">Units</option>
@@ -725,24 +798,26 @@ function showStockModal(product, mode){
   `);
   document.getElementById('modalCancel').onclick = closeModal;
   document.getElementById('modalConfirm').onclick = function(){
+    const warehouse = fixedWarehouse || document.getElementById('adjWarehouse').value.trim() || 'Main';
     let qty = parseInt(document.getElementById('adjQty').value,10) || 0;
     const boxMode = document.getElementById('adjMode').value === 'boxes';
     if(boxMode) qty = qty * (product.unitsPerBox||1);
     if(qty <= 0){ toast('Enter a quantity greater than 0', true); return; }
-    if(!isIn && qty > product.qty){ toast('Not enough stock to remove that much', true); return; }
+    const availableHere = fixedWarehouse ? currentQtyHere : (stockForWarehouse(product.upc, warehouse)?.qty || 0);
+    if(!isIn && qty > availableHere){ toast(`Not enough stock in ${warehouse} to remove that much`, true); return; }
     const note = document.getElementById('adjNote').value.trim();
     let cost;
     if(isIn){
       const costInput = document.getElementById('adjCost').value;
-      if(costInput !== ''){ cost = Math.max(0, parseFloat(costInput)||0); product.cost = cost; }
+      if(costInput !== ''){ cost = Math.max(0, parseFloat(costInput)||0); }
     }
-    stockAdjust(product.upc, isIn?qty:-qty, note || (isIn?'Stock in':'Stock out'), cost);
+    stockAdjust(product.upc, warehouse, isIn?qty:-qty, note || (isIn?'Stock in':'Stock out'), cost);
     closeModal();
-    toast(`${isIn?'Added':'Removed'} ${qty} unit(s) of ${product.name}`);
+    toast(`${isIn?'Added':'Removed'} ${qty} unit(s) of ${product.name} — ${warehouse}`);
   };
 }
-function stockAdjust(upc, delta, note, cost){
-  persist(()=>callServer('adjustStockServer', passcode, upc, delta, note, cost != null ? cost : null)).catch(()=>{});
+function stockAdjust(upc, warehouse, delta, note, cost){
+  persist(()=>callServer('adjustStockServer', passcode, upc, warehouse, delta, note, cost != null ? cost : null)).catch(()=>{});
 }
 
 /* ---------- New Product Modal ---------- */
@@ -754,6 +829,10 @@ function showNewProductModal(upc){
     <input type="text" id="npUpc" value="${esc(upc)}" ${upc?'readonly':''}>
     <label>Product name</label>
     <input type="text" id="npName" placeholder="e.g. Full-face Helmet — Matte Black, L">
+    <label>Category</label>
+    <select id="npCategory">
+      ${categories.map(c=>`<option value="${esc(c)}">${esc(c)}</option>`).join('')}
+    </select>
     <div class="row">
       <div>
         <label>Selling price (${settings.currency})</label>
@@ -774,27 +853,77 @@ function showNewProductModal(upc){
         <input type="number" id="npQty" min="0" step="1" value="0">
       </div>
     </div>
+    <label>Warehouse (this quantity goes here)</label>
+    <input type="text" id="npWarehouse" list="warehouseListDatalist" value="Main" placeholder="e.g. Main, KL-Store, JB-Warehouse">
+    <datalist id="warehouseListDatalist">${warehouseDatalist()}</datalist>
+    <label>Product photo (optional)</label>
+    <input type="file" id="npPhoto" accept="image/*">
+    <img id="npPhotoPreview" style="display:none;margin-top:8px;width:80px;height:80px;object-fit:cover;border-radius:8px;border:1px solid var(--line);">
     <div class="actions">
       <button class="btn secondary" id="modalCancel" type="button">Cancel</button>
       <button class="btn" id="modalConfirm" type="button">Add Product</button>
     </div>
   `);
+  let photoDataUrl = '';
+  document.getElementById('npPhoto').addEventListener('change', async function(e){
+    const file = e.target.files[0];
+    if(!file) return;
+    try{
+      photoDataUrl = await resizeImageToDataUrl(file);
+      const prev = document.getElementById('npPhotoPreview');
+      prev.src = photoDataUrl; prev.style.display = 'block';
+    }catch(err){ toast('Could not process that photo — try a different one', true); }
+  });
   document.getElementById('modalCancel').onclick = closeModal;
   document.getElementById('modalConfirm').onclick = async function(){
     const u = document.getElementById('npUpc').value.trim();
     const name = document.getElementById('npName').value.trim();
+    const category = document.getElementById('npCategory').value;
     const price = parseFloat(document.getElementById('npPrice').value) || 0;
     const cost = parseFloat(document.getElementById('npCost').value) || 0;
     const box = parseInt(document.getElementById('npBox').value,10) || 1;
     const qty = parseInt(document.getElementById('npQty').value,10) || 0;
+    const warehouse = document.getElementById('npWarehouse').value.trim() || 'Main';
     if(!u || !name){ toast('UPC and product name are required', true); return; }
     if(findProduct(u)){ toast('A product with this UPC already exists', true); return; }
     try{
-      await persist(()=>callServer('upsertProduct', passcode, {upc:u, name, price, cost, unitsPerBox:box, qty}));
+      await persist(()=>callServer('upsertProduct', passcode, {upc:u, name, price, cost, unitsPerBox:box, qty, warehouse, category, photo:photoDataUrl}));
       closeModal();
       toast(`${name} added to inventory`);
     }catch(err){ /* toast already shown by persist() */ }
   };
+}
+
+// Resizes/compresses an uploaded photo client-side so it stays comfortably
+// under Google Sheets' per-cell character limit, trying progressively
+// smaller/lower-quality passes if the first attempt is still too big.
+function resizeImageToDataUrl(file){
+  return new Promise((resolve, reject)=>{
+    const reader = new FileReader();
+    reader.onload = e=>{
+      const img = new Image();
+      img.onload = ()=>{
+        const attempts = [[320,0.6],[240,0.5],[160,0.4]];
+        let result = null;
+        for(const [maxDim, quality] of attempts){
+          let w = img.width, h = img.height;
+          if(w > h){ if(w > maxDim){ h = Math.round(h*maxDim/w); w = maxDim; } }
+          else { if(h > maxDim){ w = Math.round(w*maxDim/h); h = maxDim; } }
+          const canvas = document.createElement('canvas');
+          canvas.width = w; canvas.height = h;
+          canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+          const dataUrl = canvas.toDataURL('image/jpeg', quality);
+          if(dataUrl.length < 45000){ result = dataUrl; break; }
+          result = dataUrl; // keep smallest attempt even if still large
+        }
+        resolve(result);
+      };
+      img.onerror = ()=>reject(new Error('Invalid image'));
+      img.src = e.target.result;
+    };
+    reader.onerror = ()=>reject(new Error('Could not read file'));
+    reader.readAsDataURL(file);
+  });
 }
 
 /* ---------- Scanner (Scan/Stock tab) ---------- */
@@ -914,8 +1043,8 @@ function handleScan(code, context){
 
   if(context === 'sale'){
     const p = findProduct(code);
-    if(p){ addToCart(p,1); toast(`+1 ${p.name}`); }
-    else { toast('Unknown UPC — add it in Scan/Stock tab first', true); }
+    if(p) pickWarehouseAndAdd(p, 1);
+    else toast('Unknown UPC — add it in Scan/Stock tab first', true);
     addScanLogEntry(code + (p? ' → added to cart' : ' → not found'));
     return;
   }
@@ -947,6 +1076,7 @@ document.getElementById('toggleCamBtn2').addEventListener('click', async functio
         (decodedText)=> handleScan(decodedText,'sale'), ()=>{});
       scanner2Running = true;
       this.textContent = 'Stop Camera';
+      document.getElementById('captureBtn2').style.display = 'block';
     }catch(err){
       toast('Could not access camera: ' + (err && err.message?err.message:err), true);
       readerDiv.style.display = 'none';
@@ -956,6 +1086,7 @@ document.getElementById('toggleCamBtn2').addEventListener('click', async functio
     scanner2Running = false;
     readerDiv.style.display = 'none';
     this.textContent = 'Use Camera';
+    document.getElementById('captureBtn2').style.display = 'none';
   }
 });
 document.getElementById('saleUpc').addEventListener('keydown', function(e){
@@ -970,25 +1101,46 @@ document.getElementById('saleSearch').addEventListener('input', function(){
   const box = document.getElementById('saleSearchResults');
   if(!q){ box.innerHTML=''; return; }
   const matches = products.filter(p=>p.name.toLowerCase().includes(q)||p.upc.includes(q)).slice(0,6);
-  box.innerHTML = matches.map(p=>`
+  let lines = [];
+  matches.forEach(p=>{
+    const locs = stockFor(p.upc).filter(l=>l.qty>0);
+    if(!locs.length) lines.push({p, warehouse:'', qty:0});
+    else locs.forEach(l=>lines.push({p, warehouse:l.warehouse, qty:l.qty}));
+  });
+  box.innerHTML = lines.map(r=>`
     <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--line);font-size:13px;">
-      <div>${esc(p.name)} <span style="color:var(--ink-dim);font-family:var(--font-mono);font-size:11px;">(${p.qty} in stock)</span></div>
-      <button class="btn sm" data-upc="${esc(p.upc)}">Add</button>
+      <div>${esc(r.p.name)} <span style="color:var(--ink-dim);font-family:var(--font-mono);font-size:11px;">${r.warehouse ? `(${esc(r.warehouse)} · ${r.qty} in stock)` : '(out of stock)'}</span></div>
+      <button class="btn sm" data-upc="${esc(r.p.upc)}" data-wh="${esc(r.warehouse)}" ${r.qty<=0?'disabled':''}>Add</button>
     </div>`).join('') || '<div class="empty">No matches</div>';
 });
 document.getElementById('saleSearchResults').addEventListener('click', function(e){
   const btn = e.target.closest('button[data-upc]');
-  if(!btn) return;
+  if(!btn || btn.disabled) return;
   const p = findProduct(btn.dataset.upc);
-  if(p){ addToCart(p,1); toast(`+1 ${p.name}`); }
+  if(p){ addToCart(p, btn.dataset.wh, 1); toast(`+1 ${p.name} (${btn.dataset.wh})`); }
 });
 
 /* ---------- Cart / Sale ---------- */
-function addToCart(product, qty){
-  const line = cart.find(c=>c.upc===product.upc);
+function addToCart(product, warehouse, qty){
+  const line = cart.find(c=>c.upc===product.upc && c.warehouse===warehouse);
   if(line) line.qty += qty;
-  else cart.push({ upc:product.upc, name:product.name, price:product.price, qty });
+  else cart.push({ upc:product.upc, warehouse, name:product.name, price:product.price, qty });
   renderCart();
+}
+function pickWarehouseAndAdd(product, qty){
+  const locs = stockFor(product.upc).filter(l=>l.qty>0);
+  if(!locs.length){ toast(`${product.name} is out of stock in every warehouse`, true); return; }
+  if(locs.length === 1){ addToCart(product, locs[0].warehouse, qty); toast(`+${qty} ${product.name} (${locs[0].warehouse})`); return; }
+  openModal(`
+    <h3>Choose Warehouse</h3>
+    <div class="sub">${esc(product.name)} is stocked in more than one warehouse — which one is this sale from?</div>
+    ${locs.map(l=>`<button class="btn secondary block" style="margin-top:8px;" data-wh="${esc(l.warehouse)}">${esc(l.warehouse)} — ${l.qty} in stock</button>`).join('')}
+    <div class="actions"><button class="btn secondary" id="modalCancel" type="button">Cancel</button></div>
+  `);
+  document.getElementById('modalCancel').onclick = closeModal;
+  document.getElementById('modalBody').querySelectorAll('button[data-wh]').forEach(btn=>{
+    btn.onclick = ()=>{ addToCart(product, btn.dataset.wh, qty); toast(`+${qty} ${product.name} (${btn.dataset.wh})`); closeModal(); };
+  });
 }
 function renderCart(){
   const box = document.getElementById('cartLines');
@@ -1000,7 +1152,7 @@ function renderCart(){
   }
   box.innerHTML = cart.map((c,i)=>`
     <div class="cart-line">
-      <div><div class="nm">${esc(c.name)}</div><div class="upc">${esc(c.upc)}</div></div>
+      <div><div class="nm">${esc(c.name)}</div><div class="upc">${esc(c.upc)} · ${esc(c.warehouse)}</div></div>
       <input type="number" min="1" value="${c.qty}" data-idx="${i}" class="cartQty">
       <input type="number" min="0" step="0.01" value="${c.price}" data-idx="${i}" class="cartPrice">
       <div class="mono num">${money(c.price*c.qty)}</div>
@@ -1051,14 +1203,14 @@ document.getElementById('taxRateInput').value = settings.taxRate || 0;
 document.getElementById('completeSaleBtn').addEventListener('click', async function(){
   if(!cart.length){ toast('Cart is empty', true); return; }
   for(const c of cart){
-    const p = findProduct(c.upc);
-    if(!p || p.qty < c.qty){ toast(`Not enough stock for ${c.name}`, true); return; }
+    const loc = stockForWarehouse(c.upc, c.warehouse);
+    if(!loc || loc.qty < c.qty){ toast(`Not enough stock for ${c.name} in ${c.warehouse}`, true); return; }
   }
   const t = computeTotals();
   const custName = document.getElementById('custName').value.trim() || 'Walk-in customer';
   const custPhone = document.getElementById('custPhone').value.trim();
   const payload = {
-    items: cart.map(c=>({upc:c.upc,name:c.name,qty:c.qty,price:c.price})),
+    items: cart.map(c=>({upc:c.upc,name:c.name,qty:c.qty,price:c.price,warehouse:c.warehouse})),
     discountType: t.dType, discountValue: t.dVal, taxRate: t.taxRate,
     customerName: custName, customerPhone: custPhone
   };
@@ -1179,6 +1331,37 @@ function renderReports(){
   const invValue = products.reduce((s,p)=>s+p.price*p.qty,0);
   document.getElementById('repInvValue').textContent = money(invValue);
 
+  // Sales by category — computed from invoice line items (has both qty and price)
+  const catMap = {};
+  invoices.forEach(inv=>{
+    (inv.items||[]).forEach(it=>{
+      const cat = it.category || 'Uncategorized';
+      catMap[cat] = catMap[cat] || {qty:0, revenue:0};
+      catMap[cat].qty += it.qty;
+      catMap[cat].revenue += it.qty * it.price;
+    });
+  });
+  const catRows = Object.entries(catMap).sort((a,b)=>b[1].revenue-a[1].revenue);
+  const csBox = document.getElementById('categorySales');
+  csBox.innerHTML = catRows.length ? '<table><thead><tr><th>Category</th><th class="num">Units sold</th><th class="num">Revenue</th></tr></thead><tbody>' +
+    catRows.map(([cat,v])=>`<tr><td>${esc(cat)}</td><td class="num mono">${v.qty}</td><td class="num mono">${money(v.revenue)}</td></tr>`).join('') + '</tbody></table>'
+    : '<div class="empty">No sales recorded yet.</div>';
+
+  // Inventory by warehouse — total units and cost value per location
+  const whMap = {};
+  stock.forEach(s=>{
+    const p = findProduct(s.upc);
+    const wh = s.warehouse || 'Unassigned';
+    whMap[wh] = whMap[wh] || {qty:0, value:0};
+    whMap[wh].qty += s.qty;
+    whMap[wh].value += s.qty * (p && p.cost ? p.cost : 0);
+  });
+  const whRows = Object.entries(whMap).sort((a,b)=>b[1].qty-a[1].qty);
+  const whBox = document.getElementById('warehouseBreakdown');
+  whBox.innerHTML = whRows.length ? '<table><thead><tr><th>Warehouse</th><th class="num">Units</th><th class="num">Cost Value</th></tr></thead><tbody>' +
+    whRows.map(([wh,v])=>`<tr><td>${esc(wh)}</td><td class="num mono">${v.qty}</td><td class="num mono">${money(v.value)}</td></tr>`).join('') + '</tbody></table>'
+    : '<div class="empty">No stock recorded yet.</div>';
+
   const soldMap = {};
   transactions.filter(t=>t.type==='sale').forEach(t=>{
     soldMap[t.upc] = soldMap[t.upc] || {name:t.name, qty:0};
@@ -1203,8 +1386,8 @@ function renderReports(){
 
   const moves = [...transactions].reverse();
   const mBody = document.getElementById('movementLog');
-  mBody.innerHTML = moves.length ? moves.map(t=>`<tr><td class="mono">${fmtDate(t.ts)}</td><td><span class="pill ${t.type}">${t.type}</span></td><td>${esc(t.name)}</td><td class="num mono">${t.qty}</td><td class="num mono">${t.balance!=null ? t.balance : '—'}</td><td>${esc(t.note||'')}</td></tr>`).join('')
-    : `<tr><td colspan="6"><div class="empty">No stock movements yet.</div></td></tr>`;
+  mBody.innerHTML = moves.length ? moves.map(t=>`<tr><td class="mono">${fmtDate(t.ts)}</td><td><span class="pill ${t.type}">${t.type}</span></td><td>${esc(t.name)}</td><td>${esc(t.category||'—')}</td><td class="mono">${esc(t.warehouse||'—')}</td><td class="num mono">${t.qty}</td><td class="num mono">${t.balance!=null ? t.balance : '—'}</td><td>${esc(t.note||'')}</td></tr>`).join('')
+    : `<tr><td colspan="8"><div class="empty">No stock movements yet.</div></td></tr>`;
 }
 document.getElementById('invoiceList').addEventListener('click', function(e){
   const btn = e.target.closest('button[data-inv]');
