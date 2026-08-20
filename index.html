@@ -1,474 +1,1469 @@
-/*******************************************************
- * Throttle & Gear — Shared Inventory backend
- * Data lives in a Google Sheet ("Inventory DB") created
- * automatically the first time this runs, so staff on
- * different devices always see the same data.
- *
- * Data model:
- *  - Products = the catalog (one row per SKU/UPC): name,
- *    price, cost, category, photo, units per box.
- *  - Stock = quantities (one row per SKU + warehouse pair)
- *    — this is what lets the same SKU sit in multiple
- *    warehouses with separate quantities tracked.
- *  - Transactions = an append-only movement log, one row
- *    per stock-in / stock-out / sale, tagged with warehouse
- *    and category for reporting.
- *  - Invoices = one row per completed sale.
- *******************************************************/
-
-var PRODUCTS_SHEET = 'Products';
-var STOCK_SHEET = 'Stock';
-var TRANSACTIONS_SHEET = 'Transactions';
-var INVOICES_SHEET = 'Invoices';
-var SETTINGS_SHEET = 'Settings';
-
-var PRODUCTS_HEADERS = ['UPC','Name','Cost','Price','UnitsPerBox','LegacyQty','CreatedAt','Category','Photo'];
-var STOCK_HEADERS = ['UPC','Warehouse','Qty'];
-var TRANSACTIONS_HEADERS = ['ID','Timestamp','Type','UPC','Name','Qty','Balance','Note','Cost','Category','Warehouse'];
-var INVOICES_HEADERS = ['ID','Number','Date','CustomerName','CustomerPhone','ItemsJSON','Subtotal','DiscountType','DiscountValue','DiscountAmount','TaxRate','TaxAmount','Total'];
-var SETTINGS_HEADERS = ['ShopName','Address','Phone','Currency','TaxRate','Logo','InvoiceCounter','AccessCode'];
-
-var CATEGORIES = ['Seat Cover','Lock & Security','Boxes & Cases','Carpets','Helmet','Raincoat & Jacket',
-  'Mud Flaps & Splashguard','Handlebar/Grips','Protective Gear','Motorcycle Hooding and Clothing',
-  'Motorcycle Sticker/Film','Motorcycle Accessories'];
-var DEFAULT_WAREHOUSE = 'Main';
-
-/* ---------- Web app entry point ---------- */
-function doGet(e) {
-  ensureDb_();
-  return ContentService.createTextOutput(
-    'Throttle & Gear backend is running. Open the app itself at your GitHub Pages (or other static hosting) link — not this URL.'
-  ).setMimeType(ContentService.MimeType.TEXT);
-}
-
-/* ---------- JSON API entry point (called via fetch() from the hosted app) ---------- */
-var API_FUNCTIONS = {
-  getAllData: getAllData,
-  upsertProduct: upsertProduct,
-  deleteProductServer: deleteProductServer,
-  adjustStockServer: adjustStockServer,
-  completeSaleServer: completeSaleServer,
-  saveSettingsServer: saveSettingsServer,
-  resetAllDataServer: resetAllDataServer,
-  importRowsServer: importRowsServer
-};
-function doPost(e) {
-  var out;
-  try {
-    ensureDb_();
-    var req = JSON.parse(e.postData.contents);
-    var fn = API_FUNCTIONS[req.action];
-    if (!fn) throw new Error('Unknown action: ' + req.action);
-    out = fn.apply(null, req.args || []);
-  } catch (err) {
-    out = { ok: false, error: err.message };
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Throttle &amp; Gear — Inventory</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@500;600;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html5-qrcode/2.3.8/html5-qrcode.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<style>
+  :root{
+    --asphalt:#18140f;
+    --panel:#221d17;
+    --panel-2:#2b2419;
+    --line:#3a3226;
+    --paper:#f3ede2;
+    --ink:#f3ede2;
+    --ink-dim:#a89c88;
+    --amber:#ff7a1a;
+    --amber-dim:#c25e12;
+    --caution:#ffd23f;
+    --good:#5fb87a;
+    --bad:#e5544f;
+    --font-display:'Oswald',sans-serif;
+    --font-body:'Inter',sans-serif;
+    --font-mono:'IBM Plex Mono',monospace;
   }
-  return ContentService.createTextOutput(JSON.stringify(out)).setMimeType(ContentService.MimeType.JSON);
-}
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;}
+  body{
+    background:var(--asphalt);
+    color:var(--ink);
+    font-family:var(--font-body);
+    min-height:100vh;
+    background-image:
+      radial-gradient(circle at 15% 0%, rgba(255,122,26,0.06), transparent 40%),
+      repeating-linear-gradient(135deg, rgba(255,255,255,0.015) 0px, rgba(255,255,255,0.015) 2px, transparent 2px, transparent 10px);
+  }
+  ::selection{background:var(--amber);color:var(--asphalt);}
+  button{font-family:var(--font-body);cursor:pointer;}
+  input,select,textarea{font-family:var(--font-body);}
 
-/* ---------- Spreadsheet setup ---------- */
-function getDb_() {
-  var props = PropertiesService.getScriptProperties();
-  var id = props.getProperty('DB_SHEET_ID');
-  var ss;
-  if (id) {
-    try { ss = SpreadsheetApp.openById(id); } catch (e) { id = null; }
+  .app{max-width:1180px;margin:0 auto;padding:0 20px 60px;}
+
+  /* Header */
+  header.top{padding:28px 20px 0;display:flex;align-items:flex-end;justify-content:space-between;gap:20px;flex-wrap:wrap;max-width:1180px;margin:0 auto;}
+  .brandblock{display:flex;align-items:center;gap:14px;}
+  .brand-logo{width:46px;height:46px;border-radius:6px;object-fit:cover;border:2px solid var(--amber);display:none;}
+  .brand-logo.show{display:block;}
+  h1.shopname{font-family:var(--font-display);font-weight:700;font-size:28px;letter-spacing:0.5px;margin:0;text-transform:uppercase;}
+  .tagline{font-size:12px;color:var(--ink-dim);letter-spacing:1.5px;text-transform:uppercase;margin-top:2px;font-family:var(--font-mono);}
+  .headstat{text-align:right;font-family:var(--font-mono);}
+  .headstat .n{font-size:22px;font-weight:600;color:var(--amber);}
+  .headstat .l{font-size:10px;color:var(--ink-dim);text-transform:uppercase;letter-spacing:1px;}
+
+  /* hazard divider - signature element */
+  .hazard{
+    height:10px;margin:22px 0 0;
+    background:repeating-linear-gradient(135deg, var(--amber) 0 18px, var(--asphalt) 18px 36px);
+    opacity:0.9;
   }
-  if (!id) {
-    ss = SpreadsheetApp.create('Throttle & Gear — Inventory DB');
-    props.setProperty('DB_SHEET_ID', ss.getId());
+
+  nav.tabs{display:flex;gap:2px;max-width:1180px;margin:0 auto;padding:0 20px;overflow-x:auto;background:var(--panel);border-bottom:1px solid var(--line);}
+  nav.tabs button{
+    background:transparent;border:none;color:var(--ink-dim);
+    font-family:var(--font-display);text-transform:uppercase;letter-spacing:1px;
+    font-size:13px;padding:14px 16px;border-bottom:3px solid transparent;white-space:nowrap;
+    transition:color .15s, border-color .15s;
   }
-  return ss;
-}
-function ensureDb_() {
-  var ss = getDb_();
-  ensureSheet_(ss, PRODUCTS_SHEET, PRODUCTS_HEADERS);
-  ensureSheet_(ss, STOCK_SHEET, STOCK_HEADERS);
-  ensureSheet_(ss, TRANSACTIONS_SHEET, TRANSACTIONS_HEADERS);
-  ensureSheet_(ss, INVOICES_SHEET, INVOICES_HEADERS);
-  var setSheet = ensureSheet_(ss, SETTINGS_SHEET, SETTINGS_HEADERS);
-  if (setSheet.getLastRow() < 2) {
-    setSheet.appendRow(['Throttle & Gear', '', '', 'RM', 0, '', 1, '']);
+  nav.tabs button:hover{color:var(--ink);}
+  nav.tabs button.active{color:var(--amber);border-bottom-color:var(--amber);}
+
+  .filebar{
+    display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;
+    background:var(--panel-2);border-bottom:1px solid var(--line);
+    padding:9px 20px;font-size:12px;color:var(--ink-dim);
   }
-  var default1 = ss.getSheetByName('Sheet1');
-  if (default1 && ss.getSheets().length > 1) {
-    try { ss.deleteSheet(default1); } catch (e) {}
+  .filebar-status{display:flex;align-items:center;gap:8px;font-family:var(--font-mono);}
+  .filebar .dot{width:8px;height:8px;border-radius:50%;background:var(--bad);flex-shrink:0;}
+  .filebar .dot.connected{background:var(--good);}
+  .filebar .dot.syncing{background:var(--caution);}
+  .filebar-actions{display:flex;gap:8px;}
+
+  .login-overlay{position:fixed;inset:0;background:var(--asphalt);display:flex;align-items:center;justify-content:center;z-index:500;}
+  .login-box{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:32px;max-width:340px;width:100%;text-align:center;}
+  .login-box h2{font-family:var(--font-display);text-transform:uppercase;margin:0 0 6px;font-size:20px;}
+  .login-box p{color:var(--ink-dim);font-size:13px;margin:0 0 18px;}
+  .login-box input{text-align:center;letter-spacing:2px;}
+  .login-box .err{color:var(--bad);font-size:12px;margin-top:10px;min-height:16px;}
+
+  main{padding-top:24px;}
+  .panel{display:none;}
+  .panel.active{display:block;animation:fade .18s ease;}
+  @keyframes fade{from{opacity:0;transform:translateY(4px);}to{opacity:1;transform:translateY(0);}}
+
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:20px;margin-bottom:16px;}
+  .card h2{font-family:var(--font-display);text-transform:uppercase;letter-spacing:0.5px;font-size:16px;margin:0 0 14px;color:var(--paper);}
+  .card h2 small{color:var(--ink-dim);font-family:var(--font-mono);font-size:11px;text-transform:none;letter-spacing:0;margin-left:8px;}
+
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px;}
+  .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;}
+  .grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;}
+  @media (max-width:760px){.grid2{grid-template-columns:1fr;}.grid3{grid-template-columns:1fr;}.grid4{grid-template-columns:1fr 1fr;}}
+  @media (max-width:460px){.grid4{grid-template-columns:1fr;}}
+
+  .stat{background:var(--panel-2);border:1px solid var(--line);border-radius:8px;padding:16px;}
+  .stat .n{font-family:var(--font-mono);font-size:26px;font-weight:600;color:var(--amber);}
+  .stat .l{font-size:11px;color:var(--ink-dim);text-transform:uppercase;letter-spacing:1px;margin-top:4px;}
+
+  label{display:block;font-size:11px;text-transform:uppercase;letter-spacing:0.8px;color:var(--ink-dim);margin-bottom:5px;margin-top:12px;}
+  label:first-child{margin-top:0;}
+  input[type=text],input[type=number],input[type=tel],input[type=password],select,textarea{
+    width:100%;background:var(--asphalt);border:1px solid var(--line);color:var(--ink);
+    padding:10px 11px;border-radius:6px;font-size:14px;outline:none;transition:border-color .15s;
   }
-  migrateLegacyStock_(ss);
-  return ss;
-}
-// Adds any new header columns to the END of an existing sheet's header row
-// (never reorders existing ones), so upgrades never disturb existing data.
-function ensureSheet_(ss, name, headers) {
-  var sh = ss.getSheetByName(name);
-  if (!sh) sh = ss.insertSheet(name);
-  if (sh.getLastRow() === 0) {
-    sh.appendRow(headers);
-    sh.setFrozenRows(1);
-  } else {
-    var existing = sh.getRange(1, 1, 1, Math.max(sh.getLastColumn(), 1)).getValues()[0];
-    var toAdd = headers.slice(existing.length);
-    if (toAdd.length > 0) sh.getRange(1, existing.length + 1, 1, toAdd.length).setValues([toAdd]);
+  input:focus,select:focus,textarea:focus{border-color:var(--amber);}
+  .row{display:flex;gap:12px;}
+  .row > *{flex:1;}
+
+  .btn{
+    display:inline-flex;align-items:center;justify-content:center;gap:6px;
+    background:var(--amber);color:var(--asphalt);border:none;border-radius:6px;
+    padding:11px 18px;font-weight:600;font-size:13px;text-transform:uppercase;letter-spacing:0.5px;
+    transition:background .15s, transform .1s;
   }
-  return sh;
-}
-// One-time migration: older versions of this app stored a single Qty per
-// product (column F of Products). If the Stock sheet is still empty and old
-// quantities exist, seed Stock with a "Main" warehouse row per product so no
-// existing inventory counts are lost.
-function migrateLegacyStock_(ss) {
-  var stockSh = ss.getSheetByName(STOCK_SHEET);
-  if (stockSh.getLastRow() > 1) return; // already has data — never re-run
-  var prodSh = ss.getSheetByName(PRODUCTS_SHEET);
-  var last = prodSh.getLastRow();
-  if (last < 2) return;
-  var rows = prodSh.getRange(2, 1, last - 1, 6).getValues(); // UPC..LegacyQty
-  var seed = [];
-  rows.forEach(function (r) {
-    var upc = r[0], qty = Number(r[5]) || 0;
-    if (upc && qty > 0) seed.push([upc, DEFAULT_WAREHOUSE, qty]);
+  .btn:hover{background:#ff8c3d;}
+  .btn:active{transform:scale(0.98);}
+  .btn.secondary{background:transparent;color:var(--ink);border:1px solid var(--line);}
+  .btn.secondary:hover{border-color:var(--amber);color:var(--amber);}
+  .btn.good{background:var(--good);color:#0f2016;}
+  .btn.bad{background:var(--bad);color:#2b0d0c;}
+  .btn.block{width:100%;}
+  .btn.sm{padding:7px 12px;font-size:11px;}
+  .btn:disabled{opacity:0.4;cursor:not-allowed;}
+
+  table{width:100%;border-collapse:collapse;font-size:13px;}
+  th{text-align:left;font-family:var(--font-mono);font-size:10px;text-transform:uppercase;letter-spacing:0.8px;color:var(--ink-dim);padding:8px 10px;border-bottom:1px solid var(--line);}
+  td{padding:10px;border-bottom:1px solid var(--line);vertical-align:middle;}
+  tr:last-child td{border-bottom:none;}
+  td.mono,th.num{font-family:var(--font-mono);}
+  .num{text-align:right;}
+  .pill{display:inline-block;padding:2px 9px;border-radius:99px;font-size:11px;font-family:var(--font-mono);}
+  .pill.in{background:rgba(95,184,122,0.15);color:var(--good);}
+  .pill.out{background:rgba(229,84,79,0.15);color:var(--bad);}
+  .pill.sale{background:rgba(255,122,26,0.15);color:var(--amber);}
+  .pill.low{background:rgba(255,210,63,0.15);color:var(--caution);}
+
+  .scan-wrap{display:grid;grid-template-columns:340px 1fr;gap:18px;}
+  @media (max-width:820px){.scan-wrap{grid-template-columns:1fr;}}
+  #reader{width:100%;border-radius:8px;overflow:hidden;background:#000;border:1px solid var(--line);min-height:220px;}
+  .scan-hint{font-family:var(--font-mono);font-size:11px;color:var(--ink-dim);margin-top:10px;text-align:center;}
+  .manual-entry{display:flex;gap:8px;margin-top:14px;}
+
+  .empty{padding:30px 10px;text-align:center;color:var(--ink-dim);font-size:13px;}
+  .empty .big{font-family:var(--font-display);font-size:18px;color:var(--ink);text-transform:uppercase;margin-bottom:6px;}
+
+  /* Modal */
+  .overlay{position:fixed;inset:0;background:rgba(10,8,5,0.72);display:none;align-items:center;justify-content:center;z-index:100;padding:20px;}
+  .overlay.show{display:flex;}
+  .modal{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:22px;max-width:440px;width:100%;max-height:88vh;overflow-y:auto;}
+  .modal h3{font-family:var(--font-display);text-transform:uppercase;letter-spacing:0.5px;margin:0 0 4px;font-size:18px;}
+  .modal .sub{font-family:var(--font-mono);font-size:12px;color:var(--ink-dim);margin-bottom:14px;}
+  .modal .actions{display:flex;gap:10px;margin-top:20px;}
+  .modal .actions .btn{flex:1;}
+
+  .toast-stack{position:fixed;bottom:20px;right:20px;z-index:200;display:flex;flex-direction:column;gap:8px;}
+  .toast{background:var(--panel-2);border:1px solid var(--amber);color:var(--ink);padding:11px 16px;border-radius:7px;font-size:13px;box-shadow:0 6px 18px rgba(0,0,0,0.4);animation:slidein .2s ease;}
+  @keyframes slidein{from{transform:translateX(30px);opacity:0;}to{transform:translateX(0);opacity:1;}}
+
+  /* Cart */
+  .cart-line{display:grid;grid-template-columns:1fr 70px 90px 70px 32px;gap:8px;align-items:center;padding:8px 0;border-bottom:1px solid var(--line);font-size:13px;}
+  .cart-line .nm{font-weight:500;}
+  .cart-line .upc{font-family:var(--font-mono);font-size:10px;color:var(--ink-dim);}
+  .cart-line input{padding:6px 8px;font-size:13px;}
+  .totals-box{margin-top:14px;padding-top:14px;border-top:1px dashed var(--line);font-family:var(--font-mono);}
+  .totals-box .tline{display:flex;justify-content:space-between;padding:4px 0;font-size:13px;color:var(--ink-dim);}
+  .totals-box .tline.grand{font-size:20px;color:var(--amber);font-weight:600;border-top:1px solid var(--line);margin-top:6px;padding-top:10px;}
+
+  .searchbar{display:flex;gap:10px;margin-bottom:14px;}
+  .searchbar input{flex:1;}
+
+  .icon-btn{background:transparent;border:1px solid var(--line);color:var(--ink-dim);border-radius:6px;width:32px;height:32px;display:flex;align-items:center;justify-content:center;font-size:15px;}
+  .icon-btn:hover{border-color:var(--bad);color:var(--bad);}
+
+  footer.note{text-align:center;color:var(--ink-dim);font-size:11px;font-family:var(--font-mono);margin-top:30px;}
+
+  /* Invoice / print */
+  #invoicePrintArea{position:fixed;top:0;left:-99999px;width:794px;}
+  .inv-preview-wrap{max-height:56vh;overflow:auto;border:1px solid var(--line);border-radius:8px;margin-top:12px;background:#3a3226;padding:10px;}
+  .inv-preview-wrap .inv-doc{transform:scale(0.62);transform-origin:top left;width:794px;margin-bottom:-38%;}
+  .inv-doc{background:#fff;color:#1a1a1a;padding:40px;border-radius:8px;font-family:var(--font-body);}
+  .inv-doc .inv-head{display:flex;justify-content:space-between;align-items:flex-start;border-bottom:3px solid #18140f;padding-bottom:16px;margin-bottom:20px;}
+  .inv-doc .shop-name{font-family:var(--font-display);font-size:24px;text-transform:uppercase;font-weight:700;}
+  .inv-doc .shop-meta{font-size:12px;color:#555;margin-top:4px;line-height:1.5;}
+  .inv-doc .inv-title{text-align:right;}
+  .inv-doc .inv-title .big{font-family:var(--font-display);font-size:20px;text-transform:uppercase;letter-spacing:1px;}
+  .inv-doc .inv-title .num{font-family:var(--font-mono);color:#e5544f;font-size:14px;}
+  .inv-doc table{width:100%;border-collapse:collapse;margin:18px 0;}
+  .inv-doc th{background:#18140f;color:#fff;text-align:left;padding:8px 10px;font-size:11px;text-transform:uppercase;letter-spacing:0.5px;}
+  .inv-doc td{padding:8px 10px;border-bottom:1px solid #ddd;font-size:13px;}
+  .inv-doc .num{text-align:right;font-family:var(--font-mono);}
+  .inv-doc .totals{margin-left:auto;width:260px;font-family:var(--font-mono);font-size:13px;}
+  .inv-doc .totals .tl{display:flex;justify-content:space-between;padding:4px 0;}
+  .inv-doc .totals .tl.grand{font-size:17px;font-weight:700;border-top:2px solid #18140f;margin-top:4px;padding-top:8px;}
+  .inv-doc .cust{margin-top:6px;font-size:13px;color:#333;}
+  .inv-doc .thanks{margin-top:26px;font-size:12px;color:#777;text-align:center;border-top:1px dashed #ccc;padding-top:14px;}
+
+  @media print{
+    body *{visibility:hidden;}
+    #invoicePrintArea, #invoicePrintArea *{visibility:visible;}
+    #invoicePrintArea{display:block;position:absolute;top:0;left:0;width:100%;}
+    .inv-doc{border-radius:0;padding:20px;}
+  }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="brandblock">
+    <img id="brandLogo" class="brand-logo" src="" alt="logo">
+    <div>
+      <h1 class="shopname" id="brandName">Throttle &amp; Gear</h1>
+      <div class="tagline">Inventory &amp; Point of Sale</div>
+    </div>
+  </div>
+  <div class="headstat">
+    <div class="n" id="headStockCount">0</div>
+    <div class="l">Items in stock</div>
+  </div>
+</header>
+<div class="hazard"></div>
+
+<nav class="tabs" id="tabs">
+  <button data-tab="dashboard" class="active">Dashboard</button>
+  <button data-tab="scan">Scan / Stock</button>
+  <button data-tab="inventory">Inventory</button>
+  <button data-tab="sale">New Sale</button>
+  <button data-tab="reports">Reports</button>
+  <button data-tab="settings">Settings</button>
+</nav>
+
+<div class="filebar" id="filebar">
+  <div class="filebar-status" id="filebarStatus">
+    <span class="dot" id="filebarDot"></span>
+    <span id="filebarText">Connecting to shared inventory…</span>
+  </div>
+  <div class="filebar-actions">
+    <button class="btn secondary sm" id="refreshBtn" type="button">↻ Refresh</button>
+  </div>
+</div>
+
+<div class="login-overlay" id="loginOverlay">
+  <div class="login-box">
+    <h2>Throttle &amp; Gear</h2>
+    <p>Enter the shop passcode to open the shared inventory.</p>
+    <input type="password" id="loginPasscode" placeholder="Passcode" autofocus>
+    <button class="btn block" id="loginBtn" style="margin-top:14px;" type="button">Enter</button>
+    <div class="err" id="loginErr"></div>
+  </div>
+</div>
+
+<div class="app">
+<main>
+
+  <!-- DASHBOARD -->
+  <section class="panel active" id="panel-dashboard">
+    <div class="grid4">
+      <div class="stat"><div class="n" id="dashSkuCount">0</div><div class="l">SKUs tracked</div></div>
+      <div class="stat"><div class="n" id="dashUnits">0</div><div class="l">Units in stock</div></div>
+      <div class="stat"><div class="n" id="dashCost">RM 0.00</div><div class="l" id="dashCostUnits">Cost of stock on hand</div></div>
+      <div class="stat"><div class="n" id="dashRevenue">RM 0.00</div><div class="l">Total revenue</div></div>
+    </div>
+    <div class="card" style="margin-top:16px;">
+      <h2>Recent Activity</h2>
+      <div id="dashRecent"></div>
+    </div>
+  </section>
+
+  <!-- SCAN / STOCK IN-OUT -->
+  <section class="panel" id="panel-scan">
+    <div class="card">
+      <h2>Scan a Box <small>Add stock, remove stock, or register a new UPC</small></h2>
+      <div class="scan-wrap">
+        <div>
+          <div id="reader"></div>
+          <div class="scan-hint" id="scanHint">Starting camera…</div>
+          <div class="row" style="margin-top:10px;">
+            <button class="btn secondary block" id="toggleCamBtn" type="button">Start Camera</button>
+            <button class="btn secondary block" id="toggleTorchBtn" type="button" style="display:none;">Flash</button>
+          </div>
+          <button class="btn block" id="captureBtn1" type="button" style="margin-top:8px;display:none;">📸 Capture &amp; Scan</button>
+          <div class="manual-entry">
+            <input type="text" id="manualUpc" placeholder="Or type UPC manually…">
+            <button class="btn" id="manualUpcBtn" type="button">Go</button>
+          </div>
+        </div>
+        <div>
+          <h2 style="font-size:13px;">Recent Scans</h2>
+          <div id="scanLog"><div class="empty">No scans yet — point the camera at a barcode.</div></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- INVENTORY -->
+  <section class="panel" id="panel-inventory">
+    <div class="card">
+      <h2>Inventory</h2>
+      <div class="searchbar">
+        <input type="text" id="invSearch" placeholder="Search by name or UPC…">
+        <select id="invWarehouseFilter"><option value="">All warehouses</option></select>
+        <select id="invCategoryFilter"><option value="">All categories</option></select>
+      </div>
+      <div class="searchbar">
+        <button class="btn secondary" id="exportExcelBtn" type="button">⇩ Export Excel</button>
+        <button class="btn secondary" id="importExcelBtn" type="button">⇧ Import Excel</button>
+        <input type="file" id="importExcelFile" accept=".xlsx,.xls,.csv" style="display:none;">
+        <button class="btn secondary" id="addProductBtn" type="button">+ Add Product</button>
+      </div>
+      <div class="scan-hint" style="text-align:left;margin:-4px 0 14px;">One row per SKU + warehouse. Import matches rows to products by UPC — existing UPCs are updated, new UPCs are added. Export first to get the exact column format.</div>
+      <div style="overflow-x:auto;">
+        <table id="invTable">
+          <thead><tr>
+            <th>Photo</th><th>Product</th><th>Category</th><th>UPC</th><th>Warehouse</th><th class="num">Cost</th><th class="num">Price</th><th class="num">Qty</th><th class="num">Units/Box</th><th></th>
+          </tr></thead>
+          <tbody id="invTableBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- NEW SALE -->
+  <section class="panel" id="panel-sale">
+    <div class="grid2">
+      <div class="card">
+        <h2>Add Items <small>Scan or search</small></h2>
+        <div id="reader2" style="display:none;"></div>
+        <div class="row">
+          <button class="btn secondary block" id="toggleCamBtn2" type="button">Use Camera</button>
+        </div>
+        <button class="btn block" id="captureBtn2" type="button" style="margin-top:8px;display:none;">📸 Capture &amp; Scan</button>
+        <div class="manual-entry">
+          <input type="text" id="saleUpc" placeholder="Scan or type UPC, then Enter…">
+        </div>
+        <div class="searchbar" style="margin-top:14px;">
+          <input type="text" id="saleSearch" placeholder="Search inventory to add…">
+        </div>
+        <div id="saleSearchResults"></div>
+      </div>
+      <div class="card">
+        <h2>Cart</h2>
+        <div id="cartLines"><div class="empty">Cart is empty. Scan or search an item to begin.</div></div>
+        <div class="totals-box" id="cartTotals" style="display:none;"></div>
+        <div class="row" style="margin-top:14px;">
+          <div>
+            <label>Discount</label>
+            <div class="row" style="gap:6px;">
+              <select id="discountType"><option value="pct">%</option><option value="fixed">RM</option></select>
+              <input type="number" id="discountValue" value="0" min="0" step="0.01">
+            </div>
+          </div>
+          <div>
+            <label>Tax rate (%)</label>
+            <input type="number" id="taxRateInput" value="0" min="0" step="0.01">
+          </div>
+        </div>
+        <label>Customer name (optional)</label>
+        <input type="text" id="custName" placeholder="Walk-in customer">
+        <label>Customer phone (optional)</label>
+        <input type="tel" id="custPhone" placeholder="012-345 6789">
+        <button class="btn block good" id="completeSaleBtn" style="margin-top:16px;" type="button">Complete Sale &amp; Generate Invoice</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- REPORTS -->
+  <section class="panel" id="panel-reports">
+    <div class="grid3">
+      <div class="stat"><div class="n" id="repRevenue">RM 0.00</div><div class="l">Total revenue</div></div>
+      <div class="stat"><div class="n" id="repSalesCount">0</div><div class="l">Invoices issued</div></div>
+      <div class="stat"><div class="n" id="repInvValue">RM 0.00</div><div class="l">Inventory value on hand</div></div>
+    </div>
+    <div class="card" style="margin-top:16px;">
+      <h2>Sales by Category <small>which categories sell best</small></h2>
+      <div id="categorySales"></div>
+    </div>
+    <div class="card">
+      <h2>Inventory by Warehouse <small>stock spread across locations</small></h2>
+      <div id="warehouseBreakdown"></div>
+    </div>
+    <div class="card">
+      <h2>Best Sellers <small>by units sold</small></h2>
+      <div id="bestSellers"></div>
+    </div>
+    <div class="card">
+      <h2>All Invoices</h2>
+      <div id="invoiceList"></div>
+    </div>
+    <div class="card">
+      <h2>Stock Movement Log</h2>
+      <div style="overflow-x:auto;">
+        <table>
+          <thead><tr><th>Date</th><th>Type</th><th>Product</th><th>Category</th><th>Warehouse</th><th class="num">Qty</th><th class="num">Balance After</th><th>Note</th></tr></thead>
+          <tbody id="movementLog"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- SETTINGS -->
+  <section class="panel" id="panel-settings">
+    <div class="card" style="max-width:480px;">
+      <h2>Shop Details</h2>
+      <label>Shop name</label>
+      <input type="text" id="setShopName">
+      <label>Address</label>
+      <textarea id="setAddress" rows="2"></textarea>
+      <label>Phone</label>
+      <input type="text" id="setPhone">
+      <label>Currency symbol</label>
+      <input type="text" id="setCurrency">
+      <label>Default tax rate (%)</label>
+      <input type="number" id="setTaxRate" min="0" step="0.01">
+      <label>Logo</label>
+      <input type="file" id="setLogo" accept="image/*">
+      <button class="btn block" id="saveSettingsBtn" style="margin-top:18px;" type="button">Save Settings</button>
+    </div>
+    <div class="card" style="max-width:480px;border-color:var(--bad);">
+      <h2 style="color:var(--bad);">Danger Zone</h2>
+      <p style="font-size:12px;color:var(--ink-dim);">Erases all products, stock history, and invoices on this device. This cannot be undone.</p>
+      <button class="btn bad block" id="resetDataBtn" type="button">Reset All Data</button>
+    </div>
+  </section>
+
+</main>
+</div>
+
+<footer class="note">Data is stored in your shop's private Google Sheet — shared live with everyone signed into this passcode.</footer>
+
+<div class="overlay" id="overlay"><div class="modal" id="modalBody"></div></div>
+<div class="toast-stack" id="toastStack"></div>
+<div id="captureHelper" style="display:none;"></div>
+
+<div id="invoicePrintArea"><div class="inv-doc" id="invoiceDoc"></div></div>
+
+<script>
+(function(){
+"use strict";
+
+/* ---------- State ---------- */
+let settings = { shopName:"Throttle & Gear", address:"", phone:"", currency:"RM", taxRate:0, logo:"", invoiceCounter:1 };
+let products = [];      // {upc,name,price,cost,unitsPerBox,qty,createdAt,category,photo} — qty = total across all warehouses
+let stock = [];          // {upc,warehouse,qty} — one row per SKU+warehouse combo, source of truth for quantities
+let transactions = [];  // {id,ts,type,upc,name,qty,balance,note,cost,category,warehouse}
+let invoices = [];      // {id,number,date,customerName,customerPhone,items,subtotal,discountType,discountValue,discountAmount,taxRate,taxAmount,total}
+let categories = [];    // fixed list of category names, sent by the server
+let cart = [];          // {upc,warehouse,name,price,qty}
+
+/* ---------- Apps Script API Sync Layer ---------- */
+/* This page is hosted separately from Apps Script (e.g. GitHub Pages) so
+   iOS lets the camera work — it talks to your Google Sheet backend over
+   plain HTTPS instead of google.script.run. No data is stored in this
+   browser at all — every screen renders from the latest server snapshot. */
+
+// PASTE YOUR APPS SCRIPT WEB APP URL HERE (ends in /exec):
+const API_URL = 'https://script.google.com/macros/s/AKfycby54VVAbcdOuT6Kj9zliVKEifGfY5oC39zEAUjWQPNW1d6FQqMxDeobi14d6brk-CWC/exec';
+
+let passcode = '';
+let authed = false;
+let autoRefreshTimer = null;
+
+async function callServer(fnName, ...args){
+  if(!API_URL || API_URL.indexOf('PASTE_YOUR') === 0){
+    throw new Error('Backend URL not configured — edit API_URL at the top of this file');
+  }
+  const res = await fetch(API_URL, {
+    method: 'POST',
+    // text/plain avoids a CORS preflight request, which Apps Script doesn't support
+    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+    body: JSON.stringify({ action: fnName, args })
   });
-  if (seed.length > 0) stockSh.getRange(2, 1, seed.length, 3).setValues(seed);
+  if(!res.ok) throw new Error('Network error: ' + res.status);
+  return res.json();
 }
-
-/* ---------- Auth ---------- */
-function checkAuth_(code) {
-  var settings = readSettingsRow_();
-  var accessCode = String(settings.accessCode || '').trim();
-  if (accessCode && String(code || '').trim() !== accessCode) {
-    throw new Error('Incorrect passcode');
+function setFilebar(state, text){
+  const dot = document.getElementById('filebarDot');
+  dot.className = 'dot' + (state ? ' '+state : '');
+  document.getElementById('filebarText').textContent = text;
+}
+function applySnapshot(snap){
+  settings = Object.assign(settings, snap.settings || {});
+  products = Array.isArray(snap.products) ? snap.products : [];
+  stock = Array.isArray(snap.stock) ? snap.stock : [];
+  transactions = Array.isArray(snap.transactions) ? snap.transactions : [];
+  invoices = Array.isArray(snap.invoices) ? snap.invoices : [];
+  categories = Array.isArray(snap.categories) ? snap.categories : categories;
+  renderAll();
+  setFilebar('connected', 'Synced ' + new Date().toLocaleTimeString());
+}
+async function refreshData(silent){
+  if(!authed) return;
+  if(!silent) setFilebar('syncing', 'Syncing…');
+  try{
+    const res = await callServer('getAllData', passcode);
+    if(!res.ok) throw new Error(res.error || 'Sync failed');
+    applySnapshot(res.data);
+  }catch(err){
+    setFilebar('', 'Sync failed — click Refresh to retry');
+    if(!silent) toast('Could not sync: ' + (err && err.message ? err.message : err), true);
+  }
+}
+// Every mutation calls this instead of the old persist(): it sends the
+// change to the server, then re-renders from the fresh snapshot it returns.
+async function persist(serverCall){
+  setFilebar('syncing', 'Saving…');
+  try{
+    const res = await serverCall();
+    if(!res.ok) throw new Error(res.error || 'Save failed');
+    applySnapshot(res.data);
+    return res;
+  }catch(err){
+    setFilebar('', 'Save failed — data not changed on server');
+    toast('Could not save: ' + (err && err.message ? err.message : err), true);
+    await refreshData(true); // pull back the real server state so the UI doesn't drift
+    throw err;
   }
 }
 
-/* ---------- Read helpers ---------- */
-function sheetToObjects_(sh, headers) {
-  var last = sh.getLastRow();
-  if (last < 2) return [];
-  var lastCol = Math.min(headers.length, sh.getLastColumn());
-  var values = sh.getRange(2, 1, last - 1, lastCol).getValues();
-  var out = [];
-  for (var r = 0; r < values.length; r++) {
-    var row = values[r];
-    if (!row[0] && row[0] !== 0) continue;
-    var obj = {};
-    for (var c = 0; c < headers.length; c++) obj[headers[c]] = row[c] !== undefined ? row[c] : '';
-    out.push(obj);
+document.getElementById('refreshBtn').addEventListener('click', ()=>refreshData(false));
+document.getElementById('loginBtn').addEventListener('click', attemptLogin);
+document.getElementById('loginPasscode').addEventListener('keydown', e=>{ if(e.key==='Enter') attemptLogin(); });
+async function attemptLogin(){
+  const code = document.getElementById('loginPasscode').value;
+  const errEl = document.getElementById('loginErr');
+  errEl.textContent = '';
+  try{
+    const res = await callServer('getAllData', code);
+    if(!res.ok) throw new Error(res.error || 'Incorrect passcode');
+    passcode = code;
+    authed = true;
+    document.getElementById('loginOverlay').style.display = 'none';
+    applySnapshot(res.data);
+    autoRefreshTimer = setInterval(()=>refreshData(true), 20000);
+  }catch(err){
+    errEl.textContent = err && err.message ? err.message : 'Incorrect passcode';
   }
-  return out;
 }
-function readSettingsRow_() {
-  var ss = getDb_();
-  var sh = ss.getSheetByName(SETTINGS_SHEET);
-  var values = sh.getRange(2, 1, 1, SETTINGS_HEADERS.length).getValues()[0];
-  return {
-    shopName: values[0] || 'My Shop', address: values[1] || '', phone: values[2] || '',
-    currency: values[3] || 'RM', taxRate: Number(values[4]) || 0, logo: values[5] || '',
-    invoiceCounter: Number(values[6]) || 1, accessCode: values[7] || ''
+
+/* ---------- Helpers ---------- */
+function money(n){ return settings.currency + ' ' + (Math.round((n+Number.EPSILON)*100)/100).toFixed(2); }
+function uid(){ return Date.now().toString(36) + Math.random().toString(36).slice(2,7); }
+function findProduct(upc){ return products.find(p => p.upc === upc); }
+function stockFor(upc){ return stock.filter(s => s.upc === upc); }
+function stockForWarehouse(upc, warehouse){ return stock.find(s => s.upc === upc && s.warehouse === warehouse); }
+function knownWarehouses(){
+  const set = new Set(stock.map(s => s.warehouse).filter(Boolean));
+  if(!set.size) set.add('Main');
+  return Array.from(set).sort();
+}
+function warehouseDatalist(){
+  return knownWarehouses().map(w => `<option value="${esc(w)}">`).join('');
+}
+const MAX_WAREHOUSES = 5;
+function actualWarehouseSet(){ return new Set(stock.map(s => s.warehouse).filter(Boolean)); }
+// true if `name` would be a brand-new warehouse AND the shop is already at the cap
+function warehouseCapBlocks(name){
+  const set = actualWarehouseSet();
+  return !set.has(name) && set.size >= MAX_WAREHOUSES;
+}
+function warehouseCapHint(){
+  const set = actualWarehouseSet();
+  return set.size ? `${set.size} of ${MAX_WAREHOUSES} warehouses used: ${Array.from(set).sort().join(', ')}` : `0 of ${MAX_WAREHOUSES} warehouses used`;
+}
+function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function fmtDate(ts){ const d = new Date(ts); return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}); }
+
+function toast(msg, isError){
+  const el = document.createElement('div');
+  el.className = 'toast';
+  if(isError) el.style.borderColor = 'var(--bad)';
+  el.textContent = msg;
+  document.getElementById('toastStack').appendChild(el);
+  setTimeout(()=>{ el.style.opacity='0'; el.style.transition='opacity .3s'; setTimeout(()=>el.remove(),300); }, 2600);
+}
+
+function openModal(html){
+  document.getElementById('modalBody').style.maxWidth = '';
+  document.getElementById('modalBody').innerHTML = html;
+  document.getElementById('overlay').classList.add('show');
+}
+function closeModal(){
+  document.getElementById('overlay').classList.remove('show');
+  document.getElementById('modalBody').innerHTML = '';
+}
+document.getElementById('overlay').addEventListener('click', function(e){
+  if(e.target === this) closeModal();
+});
+
+/* ---------- Tabs ---------- */
+document.getElementById('tabs').addEventListener('click', function(e){
+  const btn = e.target.closest('button[data-tab]');
+  if(!btn) return;
+  document.querySelectorAll('nav.tabs button').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
+  document.getElementById('panel-'+btn.dataset.tab).classList.add('active');
+  if(btn.dataset.tab === 'reports') renderReports();
+  if(btn.dataset.tab === 'dashboard') renderDashboard();
+  if(btn.dataset.tab === 'settings') renderSettingsForm();
+});
+
+/* ---------- Render: everything ---------- */
+function renderAll(){
+  renderDashboard();
+  renderInventory();
+  renderReports();
+  renderSettingsForm();
+  renderCart();
+  document.getElementById('headStockCount').textContent = products.reduce((s,p)=>s+Number(p.qty||0),0);
+}
+
+function renderDashboard(){
+  document.getElementById('dashSkuCount').textContent = products.length;
+  const totalUnits = products.reduce((s,p)=>s+Number(p.qty||0),0);
+  document.getElementById('dashUnits').textContent = totalUnits;
+  const costOnHand = products.reduce((s,p)=>s+Number(p.cost||0)*Number(p.qty||0),0);
+  document.getElementById('dashCost').textContent = money(costOnHand);
+  document.getElementById('dashCostUnits').textContent = `Cost of stock on hand · ${totalUnits} unit${totalUnits===1?'':'s'}`;
+  const revenue = invoices.reduce((s,i)=>s+i.total,0);
+  document.getElementById('dashRevenue').textContent = money(revenue);
+  const recent = transactions.slice(-8).reverse();
+  const box = document.getElementById('dashRecent');
+  if(!recent.length){ box.innerHTML = '<div class="empty">No stock movements yet.</div>'; return; }
+  box.innerHTML = '<table><thead><tr><th>Date</th><th>Type</th><th>Product</th><th class="num">Qty</th></tr></thead><tbody>' +
+    recent.map(t => `<tr><td class="mono">${fmtDate(t.ts)}</td><td><span class="pill ${t.type}">${t.type}</span></td><td>${esc(t.name)}</td><td class="num mono">${t.qty}</td></tr>`).join('') +
+    '</tbody></table>';
+}
+
+function populateInvFilters(){
+  const whSel = document.getElementById('invWarehouseFilter');
+  const catSel = document.getElementById('invCategoryFilter');
+  const curWh = whSel.value, curCat = catSel.value;
+  whSel.innerHTML = '<option value="">All warehouses</option>' + knownWarehouses().map(w=>`<option value="${esc(w)}">${esc(w)}</option>`).join('');
+  catSel.innerHTML = '<option value="">All categories</option>' + categories.map(c=>`<option value="${esc(c)}">${esc(c)}</option>`).join('');
+  whSel.value = curWh; catSel.value = curCat;
+}
+function renderInventory(filter){
+  filter = (filter !== undefined ? filter : document.getElementById('invSearch').value || '').toLowerCase();
+  populateInvFilters();
+  const whFilter = document.getElementById('invWarehouseFilter').value;
+  const catFilter = document.getElementById('invCategoryFilter').value;
+  const body = document.getElementById('invTableBody');
+
+  // Build one row per (product, warehouse) — products with no stock rows yet still show once.
+  let rows = [];
+  products.forEach(p=>{
+    const locs = stockFor(p.upc);
+    if(!locs.length){ rows.push({p, warehouse:'', qty:0}); }
+    else locs.forEach(l=> rows.push({p, warehouse:l.warehouse, qty:l.qty}));
+  });
+  rows = rows.filter(r =>
+    (!filter || r.p.name.toLowerCase().includes(filter) || r.p.upc.includes(filter)) &&
+    (!whFilter || r.warehouse === whFilter) &&
+    (!catFilter || r.p.category === catFilter)
+  );
+
+  if(!rows.length){
+    body.innerHTML = `<tr><td colspan="10"><div class="empty"><div class="big">No products</div>Scan a box or add one manually to get started.</div></td></tr>`;
+    return;
+  }
+  body.innerHTML = rows.map(r => { const p = r.p; return `
+    <tr>
+      <td>${p.photo ? `<img src="${p.photo}" style="width:36px;height:36px;object-fit:cover;border-radius:6px;">` : `<div style="width:36px;height:36px;border-radius:6px;background:var(--panel-2);border:1px dashed var(--line);display:flex;align-items:center;justify-content:center;color:var(--ink-dim);font-size:14px;">—</div>`}</td>
+      <td>${esc(p.name)}</td>
+      <td>${p.category ? `<span class="pill sale">${esc(p.category)}</span>` : '—'}</td>
+      <td class="mono">${esc(p.upc)}</td>
+      <td class="mono">${esc(r.warehouse || '—')}</td>
+      <td class="num mono">${p.cost!=null ? money(p.cost) : '—'}</td>
+      <td class="num mono">${money(p.price)}</td>
+      <td class="num mono">${r.qty}</td>
+      <td class="num mono">${p.unitsPerBox||1}</td>
+      <td>
+        <div class="row" style="gap:6px;">
+          <button class="btn secondary sm" data-act="in" data-upc="${esc(p.upc)}" data-wh="${esc(r.warehouse)}">+In</button>
+          <button class="btn secondary sm" data-act="out" data-upc="${esc(p.upc)}" data-wh="${esc(r.warehouse)}">-Out</button>
+          <button class="icon-btn" data-act="del" data-upc="${esc(p.upc)}" title="Delete">✕</button>
+        </div>
+      </td>
+    </tr>`; }).join('');
+}
+document.getElementById('invTableBody').addEventListener('click', function(e){
+  const btn = e.target.closest('button[data-act]');
+  if(!btn) return;
+  const p = findProduct(btn.dataset.upc);
+  if(!p) return;
+  if(btn.dataset.act === 'in') showStockModal(p,'in', btn.dataset.wh || null);
+  else if(btn.dataset.act === 'out') showStockModal(p,'out', btn.dataset.wh || null);
+  else if(btn.dataset.act === 'del'){
+    if(confirm(`Remove "${p.name}" from inventory (all warehouses)? Stock history is kept.`)){
+      persist(()=>callServer('deleteProductServer', passcode, p.upc));
+      toast('Product removed');
+    }
+  }
+});
+document.getElementById('invSearch').addEventListener('input', e=>renderInventory(e.target.value));
+document.getElementById('invWarehouseFilter').addEventListener('change', ()=>renderInventory());
+document.getElementById('invCategoryFilter').addEventListener('change', ()=>renderInventory());
+document.getElementById('addProductBtn').addEventListener('click', ()=>showNewProductModal(''));
+
+/* ---------- Excel Import / Export ---------- */
+function exportInventoryExcel(){
+  if(typeof XLSX === 'undefined'){ toast('Excel library failed to load — check your connection', true); return; }
+  let rows = [];
+  products.forEach(p=>{
+    const locs = stockFor(p.upc);
+    const lines = locs.length ? locs : [{warehouse:'', qty:0}];
+    lines.forEach(l=>{
+      rows.push({
+        UPC: p.upc, Name: p.name, Category: p.category || '', Cost: p.cost!=null ? p.cost : '',
+        Price: p.price, Warehouse: l.warehouse, Qty: l.qty, 'Units per Box': p.unitsPerBox || 1
+      });
+    });
+  });
+  const ws = XLSX.utils.json_to_sheet(rows);
+  ws['!cols'] = [{wch:16},{wch:34},{wch:20},{wch:10},{wch:10},{wch:14},{wch:8},{wch:14}];
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Inventory');
+  XLSX.writeFile(wb, `inventory-${new Date().toISOString().slice(0,10)}.xlsx`);
+  toast('Inventory exported');
+}
+document.getElementById('exportExcelBtn').addEventListener('click', exportInventoryExcel);
+
+document.getElementById('importExcelBtn').addEventListener('click', ()=>document.getElementById('importExcelFile').click());
+document.getElementById('importExcelFile').addEventListener('change', function(e){
+  const file = e.target.files[0];
+  if(!file) return;
+  if(typeof XLSX === 'undefined'){ toast('Excel library failed to load — check your connection', true); return; }
+  const reader = new FileReader();
+  reader.onload = async function(ev){
+    try{
+      const data = new Uint8Array(ev.target.result);
+      const wb = XLSX.read(data, {type:'array'});
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      const rawRows = XLSX.utils.sheet_to_json(ws, {defval:''});
+      if(!rawRows.length){ toast('That file has no rows to import', true); return; }
+      const rows = rawRows.map(row => {
+        const norm = {};
+        Object.keys(row).forEach(k => { norm[k.trim().toLowerCase()] = row[k]; });
+        return {
+          upc: String(norm['upc']||'').trim(),
+          name: String(norm['name']||'').trim(),
+          category: String(norm['category']||'').trim(),
+          warehouse: String(norm['warehouse']||'').trim(),
+          price: norm['price'], cost: norm['cost'], qty: norm['qty'],
+          unitsPerBox: parseInt(norm['units per box'],10) || 1,
+          hasPrice: norm['price']!==undefined && norm['price']!=='',
+          hasCost: norm['cost']!==undefined && norm['cost']!=='',
+          hasQty: norm['qty']!==undefined && norm['qty']!==''
+        };
+      });
+      const res = await persist(()=>callServer('importRowsServer', passcode, rows));
+      toast(`Import complete — ${res.added} added, ${res.updated} updated${res.skipped?`, ${res.skipped} skipped`:''}${res.warehouseBlocked?`, ${res.warehouseBlocked} rows skipped (5-warehouse limit reached)`:''}`);
+    }catch(err){
+      toast('Could not read that file — export once first to see the expected format', true);
+    }finally{
+      e.target.value = '';
+    }
+  };
+  reader.readAsArrayBuffer(file);
+});
+
+/* ---------- Stock In/Out Modal ---------- */
+function showStockModal(product, mode, warehouseHint){
+  const isIn = mode === 'in';
+  const locs = stockFor(product.upc);
+  const fixedWarehouse = warehouseHint || (locs.length === 1 ? locs[0].warehouse : null);
+  const currentQtyHere = fixedWarehouse ? (stockForWarehouse(product.upc, fixedWarehouse)?.qty || 0) : product.qty;
+  openModal(`
+    <h3>${isIn?'Stock In':'Stock Out'}</h3>
+    <div class="sub">${esc(product.name)} · UPC ${esc(product.upc)} · ${product.qty} total across all warehouses</div>
+    ${fixedWarehouse ? `
+      <label>Warehouse</label>
+      <input type="text" value="${esc(fixedWarehouse)}" readonly style="opacity:0.7;">
+      <div class="scan-hint" style="text-align:left;margin:4px 0 0;">Currently ${currentQtyHere} unit(s) here</div>
+    ` : `
+      <label>Warehouse</label>
+      <input type="text" id="adjWarehouse" list="warehouseListDatalist" value="${locs[0]?esc(locs[0].warehouse):'Main'}" placeholder="e.g. Main, KL-Store, JB-Warehouse">
+      <datalist id="warehouseListDatalist">${warehouseDatalist()}</datalist>
+      <div class="scan-hint" style="text-align:left;margin:4px 0 0;">${locs.length>1 ? `In stock at: ${locs.map(l=>esc(l.warehouse)+' ('+l.qty+')').join(', ')}` : warehouseCapHint()}</div>
+    `}
+    <label>Mode</label>
+    <select id="adjMode">
+      <option value="units">Units</option>
+      <option value="boxes">Boxes (× ${product.unitsPerBox||1} units/box)</option>
+    </select>
+    <label>Quantity</label>
+    <input type="number" id="adjQty" min="1" value="1">
+    ${isIn ? `<label>Cost per unit (${settings.currency}) — optional</label>
+    <input type="number" id="adjCost" min="0" step="0.01" value="${product.cost!=null?product.cost:''}" placeholder="What you paid per unit">` : ''}
+    <label>Note (optional)</label>
+    <input type="text" id="adjNote" placeholder="${isIn?'e.g. supplier delivery':'e.g. damaged, returned'}">
+    <div class="actions">
+      <button class="btn secondary" id="modalCancel" type="button">Cancel</button>
+      <button class="btn ${isIn?'good':'bad'}" id="modalConfirm" type="button">${isIn?'Add Stock':'Remove Stock'}</button>
+    </div>
+  `);
+  document.getElementById('modalCancel').onclick = closeModal;
+  document.getElementById('modalConfirm').onclick = function(){
+    const warehouse = fixedWarehouse || document.getElementById('adjWarehouse').value.trim() || 'Main';
+    let qty = parseInt(document.getElementById('adjQty').value,10) || 0;
+    const boxMode = document.getElementById('adjMode').value === 'boxes';
+    if(boxMode) qty = qty * (product.unitsPerBox||1);
+    if(qty <= 0){ toast('Enter a quantity greater than 0', true); return; }
+    const availableHere = fixedWarehouse ? currentQtyHere : (stockForWarehouse(product.upc, warehouse)?.qty || 0);
+    if(!isIn && qty > availableHere){ toast(`Not enough stock in ${warehouse} to remove that much`, true); return; }
+    if(isIn && !fixedWarehouse && availableHere === 0 && warehouseCapBlocks(warehouse)){
+      toast(`Maximum of ${MAX_WAREHOUSES} warehouses reached — use one of: ${Array.from(actualWarehouseSet()).sort().join(', ')}`, true);
+      return;
+    }
+    const note = document.getElementById('adjNote').value.trim();
+    let cost;
+    if(isIn){
+      const costInput = document.getElementById('adjCost').value;
+      if(costInput !== ''){ cost = Math.max(0, parseFloat(costInput)||0); }
+    }
+    stockAdjust(product.upc, warehouse, isIn?qty:-qty, note || (isIn?'Stock in':'Stock out'), cost);
+    closeModal();
+    toast(`${isIn?'Added':'Removed'} ${qty} unit(s) of ${product.name} — ${warehouse}`);
   };
 }
-function writeSettingsRow_(settings) {
-  var ss = getDb_();
-  var sh = ss.getSheetByName(SETTINGS_SHEET);
-  sh.getRange(2, 1, 1, SETTINGS_HEADERS.length).setValues([[
-    settings.shopName, settings.address, settings.phone, settings.currency,
-    settings.taxRate, settings.logo, settings.invoiceCounter, settings.accessCode
-  ]]);
-}
-function findProductRow_(sh, upc) {
-  var last = sh.getLastRow();
-  if (last < 2) return -1;
-  var col = sh.getRange(2, 1, last - 1, 1).getValues();
-  for (var i = 0; i < col.length; i++) if (String(col[i][0]) === String(upc)) return i + 2;
-  return -1;
-}
-function findStockRow_(sh, upc, warehouse) {
-  var last = sh.getLastRow();
-  if (last < 2) return -1;
-  var vals = sh.getRange(2, 1, last - 1, 2).getValues();
-  for (var i = 0; i < vals.length; i++) {
-    if (String(vals[i][0]) === String(upc) && String(vals[i][1]) === String(warehouse)) return i + 2;
-  }
-  return -1;
-}
-function getProductCategory_(ss, upc) {
-  var sh = ss.getSheetByName(PRODUCTS_SHEET);
-  var row = findProductRow_(sh, upc);
-  if (row === -1) return '';
-  return sh.getRange(row, 8).getValue() || ''; // Category column H
+function stockAdjust(upc, warehouse, delta, note, cost){
+  persist(()=>callServer('adjustStockServer', passcode, upc, warehouse, delta, note, cost != null ? cost : null)).catch(()=>{});
 }
 
-var MAX_WAREHOUSES = 5;
-function getDistinctWarehouses_(ss) {
-  var sh = ss.getSheetByName(STOCK_SHEET);
-  var last = sh.getLastRow();
-  if (last < 2) return [];
-  var vals = sh.getRange(2, 2, last - 1, 1).getValues(); // Warehouse column B
-  var seen = {};
-  vals.forEach(function (r) { if (r[0]) seen[String(r[0])] = true; });
-  return Object.keys(seen);
-}
-// Throws if `warehouse` would be a brand-new location and the shop is
-// already at the 5-warehouse cap. Existing warehouse names are always fine.
-function assertWarehouseAllowed_(ss, warehouse) {
-  var distinct = getDistinctWarehouses_(ss);
-  if (distinct.indexOf(warehouse) === -1 && distinct.length >= MAX_WAREHOUSES) {
-    throw new Error('Maximum of ' + MAX_WAREHOUSES + ' warehouses reached (' + distinct.join(', ') + '). Use one of these instead.');
-  }
-}
-
-/* ---------- Snapshot (what the client renders from) ---------- */
-function buildSnapshot_() {
-  var ss = getDb_();
-  var stockRows = sheetToObjects_(ss.getSheetByName(STOCK_SHEET), STOCK_HEADERS).map(function (s) {
-    return { upc: String(s.UPC), warehouse: String(s.Warehouse || ''), qty: Number(s.Qty) || 0 };
+/* ---------- New Product Modal ---------- */
+function showNewProductModal(upc){
+  openModal(`
+    <h3>New Product</h3>
+    <div class="sub">${upc? 'UPC '+esc(upc)+' is not yet in your inventory' : 'Add a product manually'}</div>
+    <label>UPC / Barcode</label>
+    <input type="text" id="npUpc" value="${esc(upc)}" ${upc?'readonly':''}>
+    <label>Product name</label>
+    <input type="text" id="npName" placeholder="e.g. Full-face Helmet — Matte Black, L">
+    <label>Category</label>
+    <select id="npCategory">
+      ${categories.map(c=>`<option value="${esc(c)}">${esc(c)}</option>`).join('')}
+    </select>
+    <div class="row">
+      <div>
+        <label>Selling price (${settings.currency})</label>
+        <input type="number" id="npPrice" min="0" step="0.01" value="0">
+      </div>
+      <div>
+        <label>Cost price (${settings.currency})</label>
+        <input type="number" id="npCost" min="0" step="0.01" value="0" placeholder="What you paid">
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label>Units per box</label>
+        <input type="number" id="npBox" min="1" step="1" value="1">
+      </div>
+      <div>
+        <label>Starting quantity (units)</label>
+        <input type="number" id="npQty" min="0" step="1" value="0">
+      </div>
+    </div>
+    <label>Warehouse (this quantity goes here)</label>
+    <input type="text" id="npWarehouse" list="warehouseListDatalist" value="Main" placeholder="e.g. Main, KL-Store, JB-Warehouse">
+    <datalist id="warehouseListDatalist">${warehouseDatalist()}</datalist>
+    <div class="scan-hint" style="text-align:left;margin:4px 0 0;">${warehouseCapHint()}</div>
+    <label>Product photo (optional)</label>
+    <input type="file" id="npPhoto" accept="image/*">
+    <img id="npPhotoPreview" style="display:none;margin-top:8px;width:80px;height:80px;object-fit:cover;border-radius:8px;border:1px solid var(--line);">
+    <div class="actions">
+      <button class="btn secondary" id="modalCancel" type="button">Cancel</button>
+      <button class="btn" id="modalConfirm" type="button">Add Product</button>
+    </div>
+  `);
+  let photoDataUrl = '';
+  document.getElementById('npPhoto').addEventListener('change', async function(e){
+    const file = e.target.files[0];
+    if(!file) return;
+    try{
+      photoDataUrl = await resizeImageToDataUrl(file);
+      const prev = document.getElementById('npPhotoPreview');
+      prev.src = photoDataUrl; prev.style.display = 'block';
+    }catch(err){ toast('Could not process that photo — try a different one', true); }
   });
-  var qtyByUpc = {};
-  stockRows.forEach(function (s) { qtyByUpc[s.upc] = (qtyByUpc[s.upc] || 0) + s.qty; });
-
-  var products = sheetToObjects_(ss.getSheetByName(PRODUCTS_SHEET), PRODUCTS_HEADERS).map(function (p) {
-    return { upc: String(p.UPC), name: p.Name, cost: Number(p.Cost) || 0, price: Number(p.Price) || 0,
-      unitsPerBox: Number(p.UnitsPerBox) || 1, qty: qtyByUpc[String(p.UPC)] || 0, createdAt: p.CreatedAt,
-      category: p.Category || '', photo: p.Photo || '' };
-  });
-  var transactions = sheetToObjects_(ss.getSheetByName(TRANSACTIONS_SHEET), TRANSACTIONS_HEADERS).map(function (t) {
-    return { id: t.ID, ts: Number(t.Timestamp), type: t.Type, upc: String(t.UPC), name: t.Name,
-      qty: Number(t.Qty) || 0, balance: t.Balance === '' ? null : Number(t.Balance), note: t.Note,
-      cost: t.Cost === '' ? undefined : Number(t.Cost), category: t.Category || '', warehouse: t.Warehouse || '' };
-  });
-  var invoices = sheetToObjects_(ss.getSheetByName(INVOICES_SHEET), INVOICES_HEADERS).map(function (i) {
-    var items = [];
-    try { items = JSON.parse(i.ItemsJSON || '[]'); } catch (e) {}
-    return { id: i.ID, number: Number(i.Number), date: Number(i.Date), customerName: i.CustomerName,
-      customerPhone: i.CustomerPhone, items: items, subtotal: Number(i.Subtotal) || 0,
-      discountType: i.DiscountType, discountValue: Number(i.DiscountValue) || 0, discountAmount: Number(i.DiscountAmount) || 0,
-      taxRate: Number(i.TaxRate) || 0, taxAmount: Number(i.TaxAmount) || 0, total: Number(i.Total) || 0 };
-  });
-  var settings = readSettingsRow_();
-  delete settings.accessCode;
-  return { settings: settings, products: products, stock: stockRows, transactions: transactions,
-    invoices: invoices, categories: CATEGORIES };
-}
-
-/* ---------- Public API ---------- */
-function getAllData(code) {
-  ensureDb_();
-  checkAuth_(code);
-  return { ok: true, data: buildSnapshot_() };
-}
-
-// product: {upc, name, price, cost, unitsPerBox, category, photo, warehouse, qty}
-// Creates the catalog entry AND its first Stock row (in the given warehouse).
-function upsertProduct(code, product) {
-  var lock = LockService.getScriptLock();
-  lock.waitLock(30000);
-  try {
-    checkAuth_(code);
-    var ss = getDb_();
-    var prodSh = ss.getSheetByName(PRODUCTS_SHEET);
-    if (findProductRow_(prodSh, product.upc) !== -1) throw new Error('A product with this UPC already exists');
-    if (String(product.upc).trim() === '' || String(product.name).trim() === '') throw new Error('UPC and name are required');
-    var warehouse = String(product.warehouse || DEFAULT_WAREHOUSE).trim() || DEFAULT_WAREHOUSE;
-    var qty = Number(product.qty) || 0;
-    if (qty > 0) assertWarehouseAllowed_(ss, warehouse);
-    prodSh.appendRow([product.upc, product.name, product.cost || 0, product.price || 0,
-      product.unitsPerBox || 1, 0, new Date().toISOString(), product.category || '', product.photo || '']);
-    if (qty > 0) {
-      ss.getSheetByName(STOCK_SHEET).appendRow([product.upc, warehouse, qty]);
-      appendTransaction_('in', product.upc, product.name, qty, qty, 'Initial stock', product.cost, product.category, warehouse);
+  document.getElementById('modalCancel').onclick = closeModal;
+  document.getElementById('modalConfirm').onclick = async function(){
+    const u = document.getElementById('npUpc').value.trim();
+    const name = document.getElementById('npName').value.trim();
+    const category = document.getElementById('npCategory').value;
+    const price = parseFloat(document.getElementById('npPrice').value) || 0;
+    const cost = parseFloat(document.getElementById('npCost').value) || 0;
+    const box = parseInt(document.getElementById('npBox').value,10) || 1;
+    const qty = parseInt(document.getElementById('npQty').value,10) || 0;
+    const warehouse = document.getElementById('npWarehouse').value.trim() || 'Main';
+    if(!u || !name){ toast('UPC and product name are required', true); return; }
+    if(findProduct(u)){ toast('A product with this UPC already exists', true); return; }
+    if(qty > 0 && warehouseCapBlocks(warehouse)){
+      toast(`Maximum of ${MAX_WAREHOUSES} warehouses reached — use one of: ${Array.from(actualWarehouseSet()).sort().join(', ')}`, true);
+      return;
     }
-    return { ok: true, data: buildSnapshot_() };
-  } finally { lock.releaseLock(); }
+    try{
+      await persist(()=>callServer('upsertProduct', passcode, {upc:u, name, price, cost, unitsPerBox:box, qty, warehouse, category, photo:photoDataUrl}));
+      closeModal();
+      toast(`${name} added to inventory`);
+    }catch(err){ /* toast already shown by persist() */ }
+  };
 }
 
-function deleteProductServer(code, upc) {
-  var lock = LockService.getScriptLock();
-  lock.waitLock(30000);
-  try {
-    checkAuth_(code);
-    var ss = getDb_();
-    var prodSh = ss.getSheetByName(PRODUCTS_SHEET);
-    var row = findProductRow_(prodSh, upc);
-    if (row !== -1) prodSh.deleteRow(row);
-    // cascade-delete every Stock row for this UPC across all warehouses
-    var stockSh = ss.getSheetByName(STOCK_SHEET);
-    var last = stockSh.getLastRow();
-    if (last >= 2) {
-      var col = stockSh.getRange(2, 1, last - 1, 1).getValues();
-      for (var i = col.length - 1; i >= 0; i--) {
-        if (String(col[i][0]) === String(upc)) stockSh.deleteRow(i + 2);
-      }
-    }
-    return { ok: true, data: buildSnapshot_() };
-  } finally { lock.releaseLock(); }
-}
-
-function appendTransaction_(type, upc, name, qty, balance, note, cost, category, warehouse) {
-  var ss = getDb_();
-  var sh = ss.getSheetByName(TRANSACTIONS_SHEET);
-  sh.appendRow([Utilities.getUuid(), Date.now(), type, upc, name, qty, balance, note || '',
-    cost != null ? cost : '', category || '', warehouse || '']);
-}
-
-// Adjust stock for one SKU in one specific warehouse. Creates the Stock row
-// if this is the first time that SKU has had stock in that warehouse.
-function adjustStockServer(code, upc, warehouse, delta, note, cost) {
-  var lock = LockService.getScriptLock();
-  lock.waitLock(30000);
-  try {
-    checkAuth_(code);
-    var ss = getDb_();
-    var prodSh = ss.getSheetByName(PRODUCTS_SHEET);
-    var prodRow = findProductRow_(prodSh, upc);
-    if (prodRow === -1) throw new Error('Product not found');
-    var name = prodSh.getRange(prodRow, 2).getValue();
-    var category = prodSh.getRange(prodRow, 8).getValue() || '';
-    if (cost != null) prodSh.getRange(prodRow, 3).setValue(cost);
-
-    warehouse = String(warehouse || DEFAULT_WAREHOUSE).trim() || DEFAULT_WAREHOUSE;
-    var stockSh = ss.getSheetByName(STOCK_SHEET);
-    var stockRow = findStockRow_(stockSh, upc, warehouse);
-    if (stockRow === -1 && delta > 0) assertWarehouseAllowed_(ss, warehouse);
-    var currentQty = stockRow === -1 ? 0 : (Number(stockSh.getRange(stockRow, 3).getValue()) || 0);
-    if (delta < 0 && Math.abs(delta) > currentQty) throw new Error('Not enough stock in ' + warehouse + ' to remove that much');
-    var newQty = Math.max(0, currentQty + delta);
-    if (stockRow === -1) stockSh.appendRow([upc, warehouse, newQty]);
-    else stockSh.getRange(stockRow, 3).setValue(newQty);
-
-    appendTransaction_(delta >= 0 ? 'in' : 'out', upc, name, Math.abs(delta), newQty, note || '', cost, category, warehouse);
-    return { ok: true, data: buildSnapshot_() };
-  } finally { lock.releaseLock(); }
-}
-
-// payload: { items:[{upc,qty,price,warehouse}], discountType, discountValue, taxRate, customerName, customerPhone }
-function completeSaleServer(code, payload) {
-  var lock = LockService.getScriptLock();
-  lock.waitLock(30000);
-  try {
-    checkAuth_(code);
-    var ss = getDb_();
-    var prodSh = ss.getSheetByName(PRODUCTS_SHEET);
-    var stockSh = ss.getSheetByName(STOCK_SHEET);
-    var plan = [];
-    for (var i = 0; i < payload.items.length; i++) {
-      var item = payload.items[i];
-      var warehouse = String(item.warehouse || DEFAULT_WAREHOUSE).trim() || DEFAULT_WAREHOUSE;
-      var stockRow = findStockRow_(stockSh, item.upc, warehouse);
-      var currentQty = stockRow === -1 ? 0 : (Number(stockSh.getRange(stockRow, 3).getValue()) || 0);
-      if (currentQty < item.qty) throw new Error('Not enough stock for ' + item.name + ' in ' + warehouse);
-      var prodRow = findProductRow_(prodSh, item.upc);
-      var category = prodRow === -1 ? '' : (prodSh.getRange(prodRow, 8).getValue() || '');
-      plan.push({ stockRow: stockRow, item: item, warehouse: warehouse, currentQty: currentQty, category: category });
-    }
-    var subtotal = 0;
-    payload.items.forEach(function (it) { subtotal += it.price * it.qty; });
-    var discountAmount = payload.discountType === 'pct' ? subtotal * (payload.discountValue / 100) : Math.min(payload.discountValue, subtotal);
-    var taxable = Math.max(0, subtotal - discountAmount);
-    var taxAmount = taxable * (payload.taxRate / 100);
-    var total = taxable + taxAmount;
-
-    var settings = readSettingsRow_();
-    var number = settings.invoiceCounter || 1;
-    settings.invoiceCounter = number + 1;
-    writeSettingsRow_(settings);
-
-    var invoiceItems = [];
-    plan.forEach(function (p) {
-      var newQty = p.currentQty - p.item.qty;
-      stockSh.getRange(p.stockRow, 3).setValue(newQty);
-      appendTransaction_('sale', p.item.upc, p.item.name, p.item.qty, newQty, 'Invoice #' + number, undefined, p.category, p.warehouse);
-      invoiceItems.push({ upc: p.item.upc, name: p.item.name, qty: p.item.qty, price: p.item.price, warehouse: p.warehouse, category: p.category });
-    });
-
-    var invId = Utilities.getUuid();
-    ss.getSheetByName(INVOICES_SHEET).appendRow([invId, number, Date.now(), payload.customerName || 'Walk-in customer',
-      payload.customerPhone || '', JSON.stringify(invoiceItems), subtotal, payload.discountType, payload.discountValue,
-      discountAmount, payload.taxRate, taxAmount, total]);
-
-    return { ok: true, data: buildSnapshot_(), invoiceId: invId };
-  } finally { lock.releaseLock(); }
-}
-
-function saveSettingsServer(code, incoming) {
-  var lock = LockService.getScriptLock();
-  lock.waitLock(30000);
-  try {
-    checkAuth_(code);
-    var settings = readSettingsRow_();
-    settings.shopName = incoming.shopName || settings.shopName;
-    settings.address = incoming.address || '';
-    settings.phone = incoming.phone || '';
-    settings.currency = incoming.currency || settings.currency;
-    settings.taxRate = Number(incoming.taxRate) || 0;
-    if (incoming.logo !== undefined) settings.logo = incoming.logo;
-    writeSettingsRow_(settings);
-    return { ok: true, data: buildSnapshot_() };
-  } finally { lock.releaseLock(); }
-}
-
-function resetAllDataServer(code) {
-  var lock = LockService.getScriptLock();
-  lock.waitLock(30000);
-  try {
-    checkAuth_(code);
-    var ss = getDb_();
-    [PRODUCTS_SHEET, STOCK_SHEET, TRANSACTIONS_SHEET, INVOICES_SHEET].forEach(function (name) {
-      var sh = ss.getSheetByName(name);
-      var last = sh.getLastRow();
-      if (last > 1) sh.deleteRows(2, last - 1);
-    });
-    var settings = readSettingsRow_();
-    settings.invoiceCounter = 1;
-    writeSettingsRow_(settings);
-    return { ok: true, data: buildSnapshot_() };
-  } finally { lock.releaseLock(); }
-}
-
-// rows: [{upc,name,price,cost,unitsPerBox,category,warehouse,qty,hasPrice,hasCost,hasQty}]
-function importRowsServer(code, rows) {
-  var lock = LockService.getScriptLock();
-  lock.waitLock(30000);
-  try {
-    checkAuth_(code);
-    var ss = getDb_();
-    var prodSh = ss.getSheetByName(PRODUCTS_SHEET);
-    var stockSh = ss.getSheetByName(STOCK_SHEET);
-    var added = 0, updated = 0, skipped = 0, warehouseBlocked = 0;
-    rows.forEach(function (r) {
-      var upc = String(r.upc || '').trim();
-      var name = String(r.name || '').trim();
-      if (!upc || !name) { skipped++; return; }
-      var box = Number(r.unitsPerBox) || 1;
-      var warehouse = String(r.warehouse || DEFAULT_WAREHOUSE).trim() || DEFAULT_WAREHOUSE;
-      var prodRow = findProductRow_(prodSh, upc);
-      if (prodRow !== -1) {
-        prodSh.getRange(prodRow, 2).setValue(name);
-        if (r.hasPrice) prodSh.getRange(prodRow, 4).setValue(Math.max(0, Number(r.price) || 0));
-        if (r.hasCost) prodSh.getRange(prodRow, 3).setValue(Math.max(0, Number(r.cost) || 0));
-        prodSh.getRange(prodRow, 5).setValue(box);
-        if (r.category) prodSh.getRange(prodRow, 8).setValue(r.category);
-        updated++;
-      } else {
-        prodSh.appendRow([upc, name, r.hasCost ? Number(r.cost) || 0 : 0, r.hasPrice ? Number(r.price) || 0 : 0,
-          box, 0, new Date().toISOString(), r.category || '', '']);
-        added++;
-      }
-      if (r.hasQty) {
-        var stockRow = findStockRow_(stockSh, upc, warehouse);
-        if (stockRow === -1) {
-          try { assertWarehouseAllowed_(ss, warehouse); }
-          catch (e) { warehouseBlocked++; return; } // skip just this row's stock update, product info above still saved
+// Resizes/compresses an uploaded photo client-side so it stays comfortably
+// under Google Sheets' per-cell character limit, trying progressively
+// smaller/lower-quality passes if the first attempt is still too big.
+function resizeImageToDataUrl(file){
+  return new Promise((resolve, reject)=>{
+    const reader = new FileReader();
+    reader.onload = e=>{
+      const img = new Image();
+      img.onload = ()=>{
+        const attempts = [[320,0.6],[240,0.5],[160,0.4]];
+        let result = null;
+        for(const [maxDim, quality] of attempts){
+          let w = img.width, h = img.height;
+          if(w > h){ if(w > maxDim){ h = Math.round(h*maxDim/w); w = maxDim; } }
+          else { if(h > maxDim){ w = Math.round(w*maxDim/h); h = maxDim; } }
+          const canvas = document.createElement('canvas');
+          canvas.width = w; canvas.height = h;
+          canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+          const dataUrl = canvas.toDataURL('image/jpeg', quality);
+          if(dataUrl.length < 45000){ result = dataUrl; break; }
+          result = dataUrl; // keep smallest attempt even if still large
         }
-        var currentQty = stockRow === -1 ? 0 : (Number(stockSh.getRange(stockRow, 3).getValue()) || 0);
-        var newQty = Math.max(0, Number(r.qty) || 0);
-        var delta = newQty - currentQty;
-        if (delta !== 0) {
-          if (stockRow === -1) stockSh.appendRow([upc, warehouse, newQty]);
-          else stockSh.getRange(stockRow, 3).setValue(newQty);
-          var category = prodRow !== -1 ? (prodSh.getRange(prodRow, 8).getValue() || '') : (r.category || '');
-          appendTransaction_(delta > 0 ? 'in' : 'out', upc, name, Math.abs(delta), newQty, 'Excel import adjustment', undefined, category, warehouse);
-        }
-      }
-    });
-    return { ok: true, data: buildSnapshot_(), added: added, updated: updated, skipped: skipped, warehouseBlocked: warehouseBlocked };
-  } finally { lock.releaseLock(); }
+        resolve(result);
+      };
+      img.onerror = ()=>reject(new Error('Invalid image'));
+      img.src = e.target.result;
+    };
+    reader.onerror = ()=>reject(new Error('Could not read file'));
+    reader.readAsDataURL(file);
+  });
 }
+
+/* ---------- Scanner (Scan/Stock tab) ---------- */
+let scanner1 = null, scanner1Running = false, lastScan1 = {code:'', t:0};
+const formats = (window.Html5QrcodeSupportedFormats) ? [
+  Html5QrcodeSupportedFormats.EAN_13, Html5QrcodeSupportedFormats.EAN_8,
+  Html5QrcodeSupportedFormats.UPC_A, Html5QrcodeSupportedFormats.UPC_E,
+  Html5QrcodeSupportedFormats.CODE_128, Html5QrcodeSupportedFormats.CODE_39,
+  Html5QrcodeSupportedFormats.ITF, Html5QrcodeSupportedFormats.QR_CODE
+] : undefined;
+
+function addScanLogEntry(text){
+  const log = document.getElementById('scanLog');
+  if(log.querySelector('.empty')) log.innerHTML = '';
+  const row = document.createElement('div');
+  row.style.cssText = 'padding:8px 0;border-bottom:1px solid var(--line);font-family:var(--font-mono);font-size:12px;';
+  row.textContent = new Date().toLocaleTimeString() + '  ·  ' + text;
+  log.prepend(row);
+}
+
+async function startScanner1(){
+  if(scanner1Running) return;
+  const hint = document.getElementById('scanHint');
+  try{
+    scanner1 = new Html5Qrcode("reader");
+    await scanner1.start(
+      { facingMode:"environment" },
+      { fps:10, qrbox:{width:280,height:160}, formatsToSupport: formats },
+      (decodedText)=> handleScan(decodedText, 'stock'),
+      ()=>{}
+    );
+    scanner1Running = true;
+    hint.textContent = 'Point the camera at a barcode — or tap Capture & Scan below if it isn\u2019t picking it up automatically';
+    document.getElementById('toggleCamBtn').textContent = 'Stop Camera';
+    document.getElementById('captureBtn1').style.display = 'block';
+    checkTorch();
+  }catch(err){
+    hint.textContent = 'Camera unavailable — use manual entry below.';
+    toast('Could not access camera: ' + (err && err.message ? err.message : err), true);
+  }
+}
+async function stopScanner1(){
+  if(scanner1 && scanner1Running){
+    try{ await scanner1.stop(); scanner1.clear(); }catch(e){}
+  }
+  scanner1Running = false;
+  document.getElementById('toggleCamBtn').textContent = 'Start Camera';
+  document.getElementById('scanHint').textContent = 'Camera stopped.';
+  document.getElementById('captureBtn1').style.display = 'none';
+}
+document.getElementById('toggleCamBtn').addEventListener('click', function(){
+  scanner1Running ? stopScanner1() : startScanner1();
+});
+async function checkTorch(){
+  const btn = document.getElementById('toggleTorchBtn');
+  btn.style.display = 'none';
+  try{
+    const caps = scanner1.getRunningTrackCapabilities ? scanner1.getRunningTrackCapabilities() : null;
+    if(caps && caps.torch){
+      btn.style.display = 'inline-flex';
+      btn.onclick = async function(){
+        window.__torchOn = !window.__torchOn;
+        try{ await scanner1.applyVideoConstraints({advanced:[{torch:window.__torchOn}]}); }catch(e){}
+      };
+    }
+  }catch(e){}
+}
+
+/* ---------- Manual capture-and-decode (fallback for when live scanning misses) ---------- */
+let fileScanner = null;
+function getFileScanner(){
+  if(!fileScanner) fileScanner = new Html5Qrcode('captureHelper', { formatsToSupport: formats });
+  return fileScanner;
+}
+function grabFrameAsFile(containerId){
+  return new Promise((resolve, reject)=>{
+    const video = document.querySelector('#'+containerId+' video');
+    if(!video || !video.videoWidth){ reject(new Error('Camera not ready yet')); return; }
+    const canvas = document.createElement('canvas');
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
+    canvas.toBlob(blob=>{
+      if(!blob){ reject(new Error('Could not capture frame')); return; }
+      resolve(new File([blob], 'capture.png', {type:'image/png'}));
+    }, 'image/png');
+  });
+}
+async function captureAndScan(containerId, context, btnEl){
+  const originalLabel = btnEl.textContent;
+  btnEl.disabled = true;
+  btnEl.textContent = 'Scanning…';
+  try{
+    const file = await grabFrameAsFile(containerId);
+    const scanner = getFileScanner();
+    const decoded = await scanner.scanFile(file, false);
+    handleScan(decoded, context);
+  }catch(err){
+    toast('No barcode found in that frame — try getting closer, better light, or hold it steadier', true);
+  }finally{
+    btnEl.disabled = false;
+    btnEl.textContent = originalLabel;
+  }
+}
+document.getElementById('captureBtn1').addEventListener('click', function(){
+  captureAndScan('reader', 'stock', this);
+});
+document.getElementById('captureBtn2').addEventListener('click', function(){
+  captureAndScan('reader2', 'sale', this);
+});
+
+function handleScan(code, context){
+  const now = Date.now();
+  if(lastScan1.code === code && (now - lastScan1.t) < 1800) return; // debounce duplicate frames
+  lastScan1 = {code, t:now};
+  if(navigator.vibrate) try{navigator.vibrate(60);}catch(e){}
+
+  if(context === 'sale'){
+    const p = findProduct(code);
+    if(p) pickWarehouseAndAdd(p, 1);
+    else toast('Unknown UPC — add it in Scan/Stock tab first', true);
+    addScanLogEntry(code + (p? ' → added to cart' : ' → not found'));
+    return;
+  }
+  const p = findProduct(code);
+  addScanLogEntry(code + (p? ' → '+p.name : ' → new product'));
+  if(p) showStockModal(p, 'in');
+  else showNewProductModal(code);
+}
+
+document.getElementById('manualUpcBtn').addEventListener('click', function(){
+  const v = document.getElementById('manualUpc').value.trim();
+  if(!v) return;
+  handleScan(v, 'stock');
+  document.getElementById('manualUpc').value = '';
+});
+document.getElementById('manualUpc').addEventListener('keydown', function(e){
+  if(e.key === 'Enter') document.getElementById('manualUpcBtn').click();
+});
+
+/* Scanner for Sale tab (separate lightweight instance) */
+let scanner2 = null, scanner2Running = false;
+document.getElementById('toggleCamBtn2').addEventListener('click', async function(){
+  const readerDiv = document.getElementById('reader2');
+  if(!scanner2Running){
+    readerDiv.style.display = 'block';
+    try{
+      scanner2 = new Html5Qrcode("reader2");
+      await scanner2.start({facingMode:"environment"}, {fps:10, qrbox:{width:250,height:140}, formatsToSupport:formats},
+        (decodedText)=> handleScan(decodedText,'sale'), ()=>{});
+      scanner2Running = true;
+      this.textContent = 'Stop Camera';
+      document.getElementById('captureBtn2').style.display = 'block';
+    }catch(err){
+      toast('Could not access camera: ' + (err && err.message?err.message:err), true);
+      readerDiv.style.display = 'none';
+    }
+  }else{
+    try{ await scanner2.stop(); scanner2.clear(); }catch(e){}
+    scanner2Running = false;
+    readerDiv.style.display = 'none';
+    this.textContent = 'Use Camera';
+    document.getElementById('captureBtn2').style.display = 'none';
+  }
+});
+document.getElementById('saleUpc').addEventListener('keydown', function(e){
+  if(e.key === 'Enter'){
+    const v = this.value.trim();
+    if(v) handleScan(v,'sale');
+    this.value = '';
+  }
+});
+document.getElementById('saleSearch').addEventListener('input', function(){
+  const q = this.value.trim().toLowerCase();
+  const box = document.getElementById('saleSearchResults');
+  if(!q){ box.innerHTML=''; return; }
+  const matches = products.filter(p=>p.name.toLowerCase().includes(q)||p.upc.includes(q)).slice(0,6);
+  let lines = [];
+  matches.forEach(p=>{
+    const locs = stockFor(p.upc).filter(l=>l.qty>0);
+    if(!locs.length) lines.push({p, warehouse:'', qty:0});
+    else locs.forEach(l=>lines.push({p, warehouse:l.warehouse, qty:l.qty}));
+  });
+  box.innerHTML = lines.map(r=>`
+    <div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--line);font-size:13px;">
+      <div>${esc(r.p.name)} <span style="color:var(--ink-dim);font-family:var(--font-mono);font-size:11px;">${r.warehouse ? `(${esc(r.warehouse)} · ${r.qty} in stock)` : '(out of stock)'}</span></div>
+      <button class="btn sm" data-upc="${esc(r.p.upc)}" data-wh="${esc(r.warehouse)}" ${r.qty<=0?'disabled':''}>Add</button>
+    </div>`).join('') || '<div class="empty">No matches</div>';
+});
+document.getElementById('saleSearchResults').addEventListener('click', function(e){
+  const btn = e.target.closest('button[data-upc]');
+  if(!btn || btn.disabled) return;
+  const p = findProduct(btn.dataset.upc);
+  if(p){ addToCart(p, btn.dataset.wh, 1); toast(`+1 ${p.name} (${btn.dataset.wh})`); }
+});
+
+/* ---------- Cart / Sale ---------- */
+function addToCart(product, warehouse, qty){
+  const line = cart.find(c=>c.upc===product.upc && c.warehouse===warehouse);
+  if(line) line.qty += qty;
+  else cart.push({ upc:product.upc, warehouse, name:product.name, price:product.price, qty });
+  renderCart();
+}
+function pickWarehouseAndAdd(product, qty){
+  const locs = stockFor(product.upc).filter(l=>l.qty>0);
+  if(!locs.length){ toast(`${product.name} is out of stock in every warehouse`, true); return; }
+  if(locs.length === 1){ addToCart(product, locs[0].warehouse, qty); toast(`+${qty} ${product.name} (${locs[0].warehouse})`); return; }
+  openModal(`
+    <h3>Choose Warehouse</h3>
+    <div class="sub">${esc(product.name)} is stocked in more than one warehouse — which one is this sale from?</div>
+    ${locs.map(l=>`<button class="btn secondary block" style="margin-top:8px;" data-wh="${esc(l.warehouse)}">${esc(l.warehouse)} — ${l.qty} in stock</button>`).join('')}
+    <div class="actions"><button class="btn secondary" id="modalCancel" type="button">Cancel</button></div>
+  `);
+  document.getElementById('modalCancel').onclick = closeModal;
+  document.getElementById('modalBody').querySelectorAll('button[data-wh]').forEach(btn=>{
+    btn.onclick = ()=>{ addToCart(product, btn.dataset.wh, qty); toast(`+${qty} ${product.name} (${btn.dataset.wh})`); closeModal(); };
+  });
+}
+function renderCart(){
+  const box = document.getElementById('cartLines');
+  const totalsBox = document.getElementById('cartTotals');
+  if(!cart.length){
+    box.innerHTML = '<div class="empty">Cart is empty. Scan or search an item to begin.</div>';
+    totalsBox.style.display = 'none';
+    return;
+  }
+  box.innerHTML = cart.map((c,i)=>`
+    <div class="cart-line">
+      <div><div class="nm">${esc(c.name)}</div><div class="upc">${esc(c.upc)} · ${esc(c.warehouse)}</div></div>
+      <input type="number" min="1" value="${c.qty}" data-idx="${i}" class="cartQty">
+      <input type="number" min="0" step="0.01" value="${c.price}" data-idx="${i}" class="cartPrice">
+      <div class="mono num">${money(c.price*c.qty)}</div>
+      <button class="icon-btn" data-idx="${i}">✕</button>
+    </div>`).join('');
+  totalsBox.style.display = 'block';
+  renderTotals();
+}
+document.getElementById('cartLines').addEventListener('input', function(e){
+  const idx = e.target.dataset.idx;
+  if(idx===undefined) return;
+  if(e.target.classList.contains('cartQty')) cart[idx].qty = Math.max(1, parseInt(e.target.value,10)||1);
+  if(e.target.classList.contains('cartPrice')) cart[idx].price = Math.max(0, parseFloat(e.target.value)||0);
+  renderCart();
+});
+document.getElementById('cartLines').addEventListener('click', function(e){
+  const btn = e.target.closest('button[data-idx]');
+  if(!btn) return;
+  cart.splice(btn.dataset.idx,1);
+  renderCart();
+});
+['discountType','discountValue','taxRateInput'].forEach(id=>{
+  document.getElementById(id).addEventListener('input', renderTotals);
+});
+function computeTotals(){
+  const subtotal = cart.reduce((s,c)=>s+c.price*c.qty,0);
+  const dType = document.getElementById('discountType').value;
+  const dVal = parseFloat(document.getElementById('discountValue').value)||0;
+  const discountAmount = dType==='pct' ? subtotal*(dVal/100) : Math.min(dVal, subtotal);
+  const taxRate = parseFloat(document.getElementById('taxRateInput').value)||0;
+  const taxable = Math.max(0, subtotal - discountAmount);
+  const taxAmount = taxable*(taxRate/100);
+  const total = taxable + taxAmount;
+  return {subtotal, dType, dVal, discountAmount, taxRate, taxAmount, total};
+}
+function renderTotals(){
+  if(!cart.length) return;
+  const t = computeTotals();
+  document.getElementById('cartTotals').innerHTML = `
+    <div class="tline"><span>Subtotal</span><span>${money(t.subtotal)}</span></div>
+    <div class="tline"><span>Discount</span><span>-${money(t.discountAmount)}</span></div>
+    <div class="tline"><span>Tax (${t.taxRate}%)</span><span>${money(t.taxAmount)}</span></div>
+    <div class="tline grand"><span>Total</span><span>${money(t.total)}</span></div>
+  `;
+}
+document.getElementById('taxRateInput').value = settings.taxRate || 0;
+
+document.getElementById('completeSaleBtn').addEventListener('click', async function(){
+  if(!cart.length){ toast('Cart is empty', true); return; }
+  for(const c of cart){
+    const loc = stockForWarehouse(c.upc, c.warehouse);
+    if(!loc || loc.qty < c.qty){ toast(`Not enough stock for ${c.name} in ${c.warehouse}`, true); return; }
+  }
+  const t = computeTotals();
+  const custName = document.getElementById('custName').value.trim() || 'Walk-in customer';
+  const custPhone = document.getElementById('custPhone').value.trim();
+  const payload = {
+    items: cart.map(c=>({upc:c.upc,name:c.name,qty:c.qty,price:c.price,warehouse:c.warehouse})),
+    discountType: t.dType, discountValue: t.dVal, taxRate: t.taxRate,
+    customerName: custName, customerPhone: custPhone
+  };
+  let res;
+  try{
+    res = await persist(()=>callServer('completeSaleServer', passcode, payload));
+  }catch(err){ return; /* toast already shown by persist() */ }
+  cart = [];
+  document.getElementById('custName').value = '';
+  document.getElementById('custPhone').value = '';
+  document.getElementById('discountValue').value = 0;
+  renderAll();
+  toast('Sale completed');
+  showInvoiceModal(res.invoiceId);
+});
+
+/* ---------- Invoice ---------- */
+function buildInvoiceHTML(inv){
+  const logoHtml = settings.logo ? `<img src="${settings.logo}" style="width:56px;height:56px;object-fit:cover;border-radius:6px;margin-bottom:8px;">` : '';
+  return `
+    <div class="inv-head">
+      <div>
+        ${logoHtml}
+        <div class="shop-name">${esc(settings.shopName)}</div>
+        <div class="shop-meta">${esc(settings.address).replace(/\\n/g,'<br>')}${settings.phone? '<br>Tel: '+esc(settings.phone):''}</div>
+      </div>
+      <div class="inv-title">
+        <div class="big">Invoice</div>
+        <div class="num">#${String(inv.number).padStart(4,'0')}</div>
+        <div style="font-size:12px;color:#555;margin-top:4px;">${new Date(inv.date).toLocaleDateString()}</div>
+      </div>
+    </div>
+    <div class="cust"><strong>Bill to:</strong> ${esc(inv.customerName)}${inv.customerPhone? ' · '+esc(inv.customerPhone):''}</div>
+    <table>
+      <thead><tr><th>Item</th><th>UPC</th><th class="num">Qty</th><th class="num">Price</th><th class="num">Amount</th></tr></thead>
+      <tbody>
+        ${inv.items.map(it=>`<tr><td>${esc(it.name)}</td><td class="mono" style="font-size:11px;">${esc(it.upc)}</td><td class="num">${it.qty}</td><td class="num">${money(it.price)}</td><td class="num">${money(it.qty*it.price)}</td></tr>`).join('')}
+      </tbody>
+    </table>
+    <div class="totals">
+      <div class="tl"><span>Subtotal</span><span>${money(inv.subtotal)}</span></div>
+      <div class="tl"><span>Discount${inv.discountType==='pct' && inv.discountValue? ' ('+inv.discountValue+'%)':''}</span><span>-${money(inv.discountAmount)}</span></div>
+      <div class="tl"><span>Tax (${inv.taxRate}%)</span><span>${money(inv.taxAmount)}</span></div>
+      <div class="tl grand"><span>Total</span><span>${money(inv.total)}</span></div>
+    </div>
+    <div class="thanks">Thank you for your business — ${esc(settings.shopName)}</div>
+  `;
+}
+function printInvoice(invId){
+  const inv = invoices.find(i=>i.id===invId);
+  if(!inv) return;
+  document.getElementById('invoiceDoc').innerHTML = buildInvoiceHTML(inv);
+  setTimeout(()=>window.print(), 150);
+}
+async function generateInvoicePDF(invId){
+  if(typeof html2canvas === 'undefined' || typeof window.jspdf === 'undefined'){
+    toast('PDF library failed to load — check your connection', true);
+    return;
+  }
+  const inv = invoices.find(i=>i.id===invId);
+  if(!inv) return;
+  const doc = document.getElementById('invoiceDoc');
+  doc.innerHTML = buildInvoiceHTML(inv);
+  toast('Generating PDF…');
+  try{
+    await new Promise(r=>setTimeout(r,60));
+    const canvas = await html2canvas(doc, {scale:2, backgroundColor:'#ffffff', windowWidth:794});
+    const imgData = canvas.toDataURL('image/png');
+    const { jsPDF } = window.jspdf;
+    const pdf = new jsPDF({unit:'pt', format:'a4'});
+    const pageW = pdf.internal.pageSize.getWidth();
+    const pageH = pdf.internal.pageSize.getHeight();
+    const imgW = pageW;
+    const imgH = canvas.height * (imgW / canvas.width);
+    let heightLeft = imgH, position = 0;
+    pdf.addImage(imgData, 'PNG', 0, position, imgW, imgH);
+    heightLeft -= pageH;
+    while(heightLeft > 0){
+      position = heightLeft - imgH;
+      pdf.addPage();
+      pdf.addImage(imgData, 'PNG', 0, position, imgW, imgH);
+      heightLeft -= pageH;
+    }
+    pdf.save(`invoice-${String(inv.number).padStart(4,'0')}.pdf`);
+    toast('Invoice PDF downloaded');
+  }catch(err){
+    toast('Could not generate PDF: ' + (err && err.message ? err.message : err), true);
+  }
+}
+function showInvoiceModal(invId){
+  const inv = invoices.find(i=>i.id===invId);
+  if(!inv) return;
+  document.getElementById('invoiceDoc').innerHTML = buildInvoiceHTML(inv);
+  openModal(`
+    <h3>Invoice #${String(inv.number).padStart(4,'0')}</h3>
+    <div class="sub">${esc(inv.customerName)} · ${new Date(inv.date).toLocaleDateString()} · ${money(inv.total)}</div>
+    <div class="inv-preview-wrap" id="invPreviewSlot"></div>
+    <div class="actions">
+      <button class="btn secondary" id="modalCancel" type="button">Close</button>
+      <button class="btn secondary" id="printInvBtn" type="button">Print</button>
+      <button class="btn" id="pdfInvBtn" type="button">Download PDF</button>
+    </div>
+  `);
+  const clone = document.getElementById('invoiceDoc').cloneNode(true);
+  document.getElementById('invPreviewSlot').appendChild(clone);
+  document.getElementById('modalBody').style.maxWidth = '560px';
+  document.getElementById('modalCancel').onclick = closeModal;
+  document.getElementById('printInvBtn').onclick = ()=>printInvoice(inv.id);
+  document.getElementById('pdfInvBtn').onclick = ()=>generateInvoicePDF(inv.id);
+}
+window.__printInvoice = printInvoice; // used by inline handlers below
+
+/* ---------- Reports ---------- */
+function renderReports(){
+  const revenue = invoices.reduce((s,i)=>s+i.total,0);
+  document.getElementById('repRevenue').textContent = money(revenue);
+  document.getElementById('repSalesCount').textContent = invoices.length;
+  const invValue = products.reduce((s,p)=>s+p.price*p.qty,0);
+  document.getElementById('repInvValue').textContent = money(invValue);
+
+  // Sales by category — computed from invoice line items (has both qty and price)
+  const catMap = {};
+  invoices.forEach(inv=>{
+    (inv.items||[]).forEach(it=>{
+      const cat = it.category || 'Uncategorized';
+      catMap[cat] = catMap[cat] || {qty:0, revenue:0};
+      catMap[cat].qty += it.qty;
+      catMap[cat].revenue += it.qty * it.price;
+    });
+  });
+  const catRows = Object.entries(catMap).sort((a,b)=>b[1].revenue-a[1].revenue);
+  const csBox = document.getElementById('categorySales');
+  csBox.innerHTML = catRows.length ? '<table><thead><tr><th>Category</th><th class="num">Units sold</th><th class="num">Revenue</th></tr></thead><tbody>' +
+    catRows.map(([cat,v])=>`<tr><td>${esc(cat)}</td><td class="num mono">${v.qty}</td><td class="num mono">${money(v.revenue)}</td></tr>`).join('') + '</tbody></table>'
+    : '<div class="empty">No sales recorded yet.</div>';
+
+  // Inventory by warehouse — total units and cost value per location
+  const whMap = {};
+  stock.forEach(s=>{
+    const p = findProduct(s.upc);
+    const wh = s.warehouse || 'Unassigned';
+    whMap[wh] = whMap[wh] || {qty:0, value:0};
+    whMap[wh].qty += s.qty;
+    whMap[wh].value += s.qty * (p && p.cost ? p.cost : 0);
+  });
+  const whRows = Object.entries(whMap).sort((a,b)=>b[1].qty-a[1].qty);
+  const whBox = document.getElementById('warehouseBreakdown');
+  whBox.innerHTML = whRows.length ? '<table><thead><tr><th>Warehouse</th><th class="num">Units</th><th class="num">Cost Value</th></tr></thead><tbody>' +
+    whRows.map(([wh,v])=>`<tr><td>${esc(wh)}</td><td class="num mono">${v.qty}</td><td class="num mono">${money(v.value)}</td></tr>`).join('') + '</tbody></table>'
+    : '<div class="empty">No stock recorded yet.</div>';
+
+  const soldMap = {};
+  transactions.filter(t=>t.type==='sale').forEach(t=>{
+    soldMap[t.upc] = soldMap[t.upc] || {name:t.name, qty:0};
+    soldMap[t.upc].qty += t.qty;
+  });
+  const best = Object.values(soldMap).sort((a,b)=>b.qty-a.qty).slice(0,5);
+  const bs = document.getElementById('bestSellers');
+  bs.innerHTML = best.length ? '<table><thead><tr><th>Product</th><th class="num">Units sold</th></tr></thead><tbody>' +
+    best.map(b=>`<tr><td>${esc(b.name)}</td><td class="num mono">${b.qty}</td></tr>`).join('') + '</tbody></table>'
+    : '<div class="empty">No sales recorded yet.</div>';
+
+  const invList = document.getElementById('invoiceList');
+  const sorted = [...invoices].sort((a,b)=>b.date-a.date);
+  invList.innerHTML = sorted.length ? '<table><thead><tr><th>#</th><th>Date</th><th>Customer</th><th class="num">Total</th><th></th></tr></thead><tbody>' +
+    sorted.map(i=>`<tr><td class="mono">#${String(i.number).padStart(4,'0')}</td><td class="mono">${fmtDate(i.date)}</td><td>${esc(i.customerName)}</td><td class="num mono">${money(i.total)}</td><td>
+      <div class="row" style="gap:6px;">
+        <button class="btn secondary sm" data-act="view" data-inv="${i.id}">View</button>
+        <button class="btn sm" data-act="pdf" data-inv="${i.id}">PDF</button>
+      </div>
+    </td></tr>`).join('') + '</tbody></table>'
+    : '<div class="empty">No invoices yet.</div>';
+
+  const moves = [...transactions].reverse();
+  const mBody = document.getElementById('movementLog');
+  mBody.innerHTML = moves.length ? moves.map(t=>`<tr><td class="mono">${fmtDate(t.ts)}</td><td><span class="pill ${t.type}">${t.type}</span></td><td>${esc(t.name)}</td><td>${esc(t.category||'—')}</td><td class="mono">${esc(t.warehouse||'—')}</td><td class="num mono">${t.qty}</td><td class="num mono">${t.balance!=null ? t.balance : '—'}</td><td>${esc(t.note||'')}</td></tr>`).join('')
+    : `<tr><td colspan="8"><div class="empty">No stock movements yet.</div></td></tr>`;
+}
+document.getElementById('invoiceList').addEventListener('click', function(e){
+  const btn = e.target.closest('button[data-inv]');
+  if(!btn) return;
+  if(btn.dataset.act === 'pdf') generateInvoicePDF(btn.dataset.inv);
+  else showInvoiceModal(btn.dataset.inv);
+});
+
+/* ---------- Settings ---------- */
+function renderSettingsForm(){
+  document.getElementById('setShopName').value = settings.shopName || '';
+  document.getElementById('setAddress').value = settings.address || '';
+  document.getElementById('setPhone').value = settings.phone || '';
+  document.getElementById('setCurrency').value = settings.currency || 'RM';
+  document.getElementById('setTaxRate').value = settings.taxRate || 0;
+  document.getElementById('brandName').textContent = settings.shopName || 'Shop';
+  const logoEl = document.getElementById('brandLogo');
+  if(settings.logo){ logoEl.src = settings.logo; logoEl.classList.add('show'); } else { logoEl.classList.remove('show'); }
+}
+document.getElementById('setLogo').addEventListener('change', function(e){
+  const file = e.target.files[0];
+  if(!file) return;
+  const reader = new FileReader();
+  reader.onload = ()=>{ settings.logo = reader.result; };
+  reader.readAsDataURL(file);
+});
+document.getElementById('saveSettingsBtn').addEventListener('click', async function(){
+  const incoming = {
+    shopName: document.getElementById('setShopName').value.trim() || 'My Shop',
+    address: document.getElementById('setAddress').value.trim(),
+    phone: document.getElementById('setPhone').value.trim(),
+    currency: document.getElementById('setCurrency').value.trim() || 'RM',
+    taxRate: parseFloat(document.getElementById('setTaxRate').value) || 0,
+    logo: settings.logo
+  };
+  try{
+    await persist(()=>callServer('saveSettingsServer', passcode, incoming));
+    renderSettingsForm();
+    document.getElementById('taxRateInput').value = settings.taxRate;
+    toast('Settings saved');
+  }catch(err){ /* toast already shown by persist() */ }
+});
+document.getElementById('resetDataBtn').addEventListener('click', async function(){
+  if(!confirm('This will permanently erase all products, stock history, and invoices for everyone. Continue?')) return;
+  if(!confirm('Are you absolutely sure? This cannot be undone.')) return;
+  cart = [];
+  try{
+    await persist(()=>callServer('resetAllDataServer', passcode));
+    toast('All data has been reset');
+  }catch(err){ /* toast already shown by persist() */ }
+});
+
+/* ---------- Init ---------- */
+renderAll(); // renders an empty shell behind the login overlay
+
+})();
+</script>
+</body>
+</html>
